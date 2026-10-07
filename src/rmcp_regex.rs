@@ -4,6 +4,8 @@
 //! pattern has no contextual assertions except its penultimate whitespace
 //! branch. Its explicit Unicode tables are retained verbatim.
 
+use regex_automata::{Anchored, Input, MatchKind, meta, util::syntax};
+
 const GUARDED_PATTERN: &str = include_str!("rmcp_pattern.txt");
 // Exact table in the captured HF pattern, not Rust's Unicode whitespace API.
 fn is_guarded_whitespace(scalar: char) -> bool {
@@ -15,7 +17,31 @@ fn is_guarded_whitespace(scalar: char) -> bool {
     )
 }
 
-pub(crate) fn compile_if_guarded(pattern: &str) -> Result<Option<regex::Regex>, regex::Error> {
+// Match regex 1.13.1's string builder and its public error conversion while
+// exposing Input::anchored to the iterator. Do not enable earliest matching.
+fn build_regular_regex(pattern: &str) -> Result<meta::Regex, regex::Error> {
+    meta::Regex::builder()
+        .configure(
+            meta::Regex::config()
+                .nfa_size_limit(Some(10 * (1 << 20)))
+                .hybrid_cache_capacity(2 * (1 << 20))
+                .match_kind(MatchKind::LeftmostFirst)
+                .utf8_empty(true),
+        )
+        .syntax(syntax::Config::default().utf8(true))
+        .build(pattern)
+        .map_err(|error| {
+            if let Some(size_limit) = error.size_limit() {
+                regex::Error::CompiledTooBig(size_limit)
+            } else if let Some(error) = error.syntax_error() {
+                regex::Error::Syntax(error.to_string())
+            } else {
+                regex::Error::Syntax(error.to_string())
+            }
+        })
+}
+
+pub(crate) fn compile_if_guarded(pattern: &str) -> Result<Option<meta::Regex>, regex::Error> {
     if pattern != GUARDED_PATTERN {
         return Ok(None);
     }
@@ -30,7 +56,7 @@ pub(crate) fn compile_if_guarded(pattern: &str) -> Result<Option<regex::Regex>, 
     if lookahead != format!("{whitespace}(?![^{class}])") {
         return Err(invalid());
     }
-    regex::Regex::new(&format!("{prefix}|{whitespace}")).map(Some)
+    build_regular_regex(&format!("{prefix}|{whitespace}")).map(Some)
 }
 
 pub(crate) enum Pieces<'r, 't, I> {
@@ -53,19 +79,21 @@ where
 }
 
 pub(crate) struct RegularPieces<'r, 't> {
-    regex: &'r regex::Regex,
+    regex: &'r meta::Regex,
     text: &'t str,
     base: usize,
-    matches: regex::Matches<'r, 't>,
+    matches: meta::FindMatches<'r, 't>,
 }
 
 impl<'r, 't> RegularPieces<'r, 't> {
-    pub(crate) fn new(regex: &'r regex::Regex, text: &'t str) -> Self {
+    pub(crate) fn new(regex: &'r meta::Regex, text: &'t str) -> Self {
         Self {
             regex,
             text,
             base: 0,
-            matches: regex.find_iter(text),
+            // The guarded alternatives cover each next scalar. Anchoring
+            // supplies the known start and keeps one cache for the iterator.
+            matches: regex.find_iter(Input::new(text).anchored(Anchored::Yes)),
         }
     }
 }
@@ -86,7 +114,7 @@ impl<'t> Iterator for RegularPieces<'_, 't> {
         // Only the whitespace alternative can end in this exact table: the
         // earlier L/N/other alternatives end outside it, as do contractions.
         if end < self.text.len() {
-            let (final_offset, final_scalar) = matched.as_str()
+            let (final_offset, final_scalar) = self.text[start..end]
                 .char_indices()
                 .next_back()
                 .expect("the guarded alternatives are nonempty");
@@ -96,7 +124,9 @@ impl<'t> Iterator for RegularPieces<'_, 't> {
                 // to the next existing match is wrong before contractions.
                 // Slice restart is valid only for this context-free pattern.
                 self.base = end;
-                self.matches = self.regex.find_iter(&self.text[end..]);
+                self.matches = self.regex.find_iter(
+                    Input::new(&self.text[end..]).anchored(Anchored::Yes),
+                );
             }
         }
         Some(&self.text[start..end])
@@ -107,19 +137,21 @@ impl<'t> Iterator for RegularPieces<'_, 't> {
 mod tests {
     use std::collections::HashSet;
 
-    use super::{GUARDED_PATTERN, RegularPieces, compile_if_guarded, is_guarded_whitespace};
+    use regex_automata::{Anchored, meta};
+
+    use super::{GUARDED_PATTERN, RegularPieces, build_regular_regex, compile_if_guarded, is_guarded_whitespace};
     use crate::{CoreBPE, HashMap, Rank};
 
     const GUARDED_WHITESPACE: &str = r"\x{9}-\x{d}\x{20}\x{85}\x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}-\x{2029}\x{202f}\x{205f}\x{3000}";
 
-    fn matchers() -> (fancy_regex::Regex, regex::Regex) {
+    fn matchers() -> (fancy_regex::Regex, meta::Regex) {
         (
             fancy_regex::Regex::new(GUARDED_PATTERN).unwrap(),
             compile_if_guarded(GUARDED_PATTERN).unwrap().unwrap(),
         )
     }
 
-    fn assert_spans_equal(original: &fancy_regex::Regex, regular: &regex::Regex, text: &str) {
+    fn assert_spans_equal(original: &fancy_regex::Regex, regular: &meta::Regex, text: &str) {
         let expected: Vec<_> = original
             .find_iter(text)
             .map(|matched| {
@@ -199,7 +231,7 @@ mod tests {
             for suffix in ["", "a", "1", "!", "'s", "'re", "'S", "<S>"] {
                 let text = format!("a{scalar} {scalar}{suffix}");
                 for matched in regular.find_iter(&text) {
-                    let piece = matched.as_str();
+                    let piece = &text[matched.range()];
                     let last = piece.chars().next_back().unwrap();
                     assert_eq!(is_guarded_whitespace(last), piece.chars().all(is_guarded_whitespace), "piece {piece:?}");
                 }
@@ -257,7 +289,7 @@ mod tests {
 
     #[test]
     fn bounded_exhaustive_actual_pattern_spans_match() {
-        fn visit(original: &fancy_regex::Regex, regular: &regex::Regex, text: &mut String, remaining: usize) -> usize {
+        fn visit(original: &fancy_regex::Regex, regular: &meta::Regex, text: &mut String, remaining: usize) -> usize {
             assert_spans_equal(original, regular, text);
             let mut count = 1;
             if remaining > 0 {
@@ -289,6 +321,40 @@ mod tests {
             for allowed in &allowed_sets {
                 assert_eq!(candidate.encode(text, allowed).unwrap(), original.encode(text, allowed).unwrap(), "{text:?}, {allowed:?}");
             }
+        }
+    }
+
+    #[test]
+    fn anchored_iterator_reanchors_after_matches_and_whitespace_restarts() {
+        let (original, regular) = matchers();
+        let text = "aa11!!bb  's\u{3000}\u{a0}é  ";
+        let mut pieces = RegularPieces::new(&regular, text);
+        let mut actual = Vec::new();
+        let mut saw_restart = false;
+        loop {
+            assert_eq!(pieces.matches.input().get_anchored(), Anchored::Yes);
+            assert!(!pieces.matches.input().get_earliest());
+            let Some(piece) = pieces.next() else { break };
+            saw_restart |= pieces.base > 0;
+            actual.push(piece);
+        }
+        assert!(saw_restart);
+        assert!(actual.len() > 4);
+        assert_eq!(actual.concat(), text);
+        assert_spans_equal(&original, &regular, text);
+
+        // An unanchored iterator would skip the gap and return a second "a".
+        // The admitted pattern has no gaps; this isolates anchoring itself.
+        let simple = build_regular_regex("a").unwrap();
+        assert_eq!(RegularPieces::new(&simple, "a a").collect::<Vec<_>>(), ["a"]);
+    }
+
+    #[test]
+    fn regular_builder_preserves_public_syntax_and_size_errors() {
+        for pattern in ["[", "a{1000000000}"] {
+            let expected = regex::Regex::new(pattern).unwrap_err();
+            let actual = build_regular_regex(pattern).unwrap_err();
+            assert_eq!(actual, expected);
         }
     }
 }

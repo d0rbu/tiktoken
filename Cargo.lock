@@ -244,6 +244,7 @@ dependencies = [
  "fancy-regex",
  "pyo3",
  "regex",
+ "regex-automata",
  "rustc-hash",
 ]
 
