@@ -9,6 +9,7 @@ use rustc_hash::FxHashMap as HashMap;
 
 #[cfg(feature = "python")]
 mod py;
+mod rmcp_regex;
 
 pub type Rank = u32;
 
@@ -323,6 +324,7 @@ pub struct CoreBPE {
     decoder: HashMap<Rank, Vec<u8>>,
     special_tokens_decoder: HashMap<Rank, Vec<u8>>,
     regex_tls: Vec<Regex>,
+    regular_regex_tls: Option<Vec<regex::Regex>>,
     special_regex_tls: Vec<Regex>,
     sorted_token_bytes: Vec<Vec<u8>>,
 }
@@ -337,6 +339,23 @@ impl CoreBPE {
 
     fn _get_tl_special_regex(&self) -> &Regex {
         &self.special_regex_tls[hash_current_thread() % MAX_NUM_THREADS]
+    }
+
+    fn _ordinary_pieces<'a>(
+        &'a self,
+        text: &'a str,
+    ) -> impl Iterator<Item = Result<&'a str, fancy_regex::Error>> {
+        match &self.regular_regex_tls {
+            Some(regexes) => rmcp_regex::Pieces::Regular(rmcp_regex::RegularPieces::new(
+                &regexes[hash_current_thread() % MAX_NUM_THREADS],
+                text,
+            )),
+            None => rmcp_regex::Pieces::Original(
+                self._get_tl_regex()
+                    .find_iter(text)
+                    .map(|matched| matched.map(|matched| matched.as_str())),
+            ),
+        }
     }
 
     /// Decodes tokens into a list of bytes.
@@ -360,10 +379,9 @@ impl CoreBPE {
     pub fn encode_ordinary(&self, text: &str) -> Vec<Rank> {
         // This is the core of the encoding logic; the other functions in here
         // just make things complicated :-)
-        let regex = self._get_tl_regex();
         let mut ret = vec![];
-        for mat in regex.find_iter(text) {
-            let piece = mat.unwrap().as_str().as_bytes();
+        for piece in self._ordinary_pieces(text) {
+            let piece = piece.unwrap().as_bytes();
             match self.encoder.get(piece) {
                 Some(token) => ret.push(*token),
                 None => ret.extend(&byte_pair_encode(piece, &self.encoder)),
@@ -378,7 +396,6 @@ impl CoreBPE {
         allowed_special: &HashSet<&str>,
     ) -> Result<(Vec<Rank>, usize), EncodeError> {
         let special_regex = self._get_tl_special_regex();
-        let regex = self._get_tl_regex();
         let mut ret = vec![];
 
         let mut start = 0;
@@ -402,9 +419,9 @@ impl CoreBPE {
             let end = next_special.map_or(text.len(), |m| m.start());
 
             // Okay, here we go, compare this logic to encode_ordinary
-            for mat_res in regex.find_iter(&text[start..end]) {
-                let mat = match mat_res {
-                    Ok(m) => m,
+            for piece_res in self._ordinary_pieces(&text[start..end]) {
+                let piece = match piece_res {
+                    Ok(piece) => piece,
                     Err(e) => {
                         return Err(EncodeError {
                             message: format!("Regex error while tokenizing: {e}"),
@@ -412,7 +429,7 @@ impl CoreBPE {
                     }
                 };
 
-                let piece = mat.as_str().as_bytes();
+                let piece = piece.as_bytes();
                 if let Some(token) = self.encoder.get(piece) {
                     last_piece_token_len = 1;
                     ret.push(*token);
@@ -621,6 +638,7 @@ impl CoreBPE {
         pattern: &str,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let regex = Regex::new(pattern)?;
+        let regular_regex = rmcp_regex::compile_if_guarded(pattern)?;
 
         let special_regex = {
             let parts = special_tokens_encoder
@@ -655,6 +673,8 @@ impl CoreBPE {
             decoder,
             special_tokens_decoder,
             regex_tls: (0..MAX_NUM_THREADS).map(|_| regex.clone()).collect(),
+            regular_regex_tls: regular_regex
+                .map(|regex| (0..MAX_NUM_THREADS).map(|_| regex.clone()).collect()),
             special_regex_tls: (0..MAX_NUM_THREADS)
                 .map(|_| special_regex.clone())
                 .collect(),
