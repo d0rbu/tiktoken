@@ -69,6 +69,26 @@ impl CoreBPE {
         buffer.into_py_any(py)
     }
 
+    fn encode_to_tiktoken_buffers(
+        &self,
+        py: Python,
+        texts: Vec<PyBackedStr>,
+        allowed_special: HashSet<PyBackedStr>,
+    ) -> PyResult<Vec<Py<PyAny>>> {
+        let rows = py.detach(|| {
+            let allowed_special: HashSet<&str> =
+                allowed_special.iter().map(|s| s.as_ref()).collect();
+            self.encode_batch_serial(texts.iter().map(|text| text.as_ref()), &allowed_special)
+        });
+        let rows = match rows {
+            Ok(rows) => rows,
+            Err(e) => return Err(PyErr::new::<exceptions::PyValueError, _>(e.message)),
+        };
+        rows.into_iter()
+            .map(|tokens| TiktokenBuffer { tokens }.into_py_any(py))
+            .collect()
+    }
+
     fn _encode_bytes(&self, py: Python, bytes: &[u8]) -> Vec<Rank> {
         py.detach(|| {
             match std::str::from_utf8(bytes) {

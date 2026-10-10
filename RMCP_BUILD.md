@@ -1,15 +1,16 @@
-# RMCP native anchored-span build
+# RMCP native owned-buffer batch build
 
 This source starts at upstream tiktoken 0.14.0, commit
-`4e71bbe0c078468e00fefbf94b39849389f346e5`, and extends the delivered RMCP span
-implementation `313a3959314987bbb6130b94a25f85c202462f69`. Python distribution
-version `0.14.0+rmcp.2` identifies this delivery. The upstream MIT license is
+`4e71bbe0c078468e00fefbf94b39849389f346e5`, and extends the delivered RMCP anchored
+matcher `a4804e19fb491d12e61bb06bfa635a989c158bbd`. Python distribution
+version `0.14.0+rmcp.3` identifies this delivery. The upstream MIT license is
 retained.
 
-The Rust sources and Cargo inputs are byte-identical to the measured anchored
-prototype `f62df98a1f3eab00751022c0d7278439444cff69`. Only the Python version and
-this build note change for delivery. Cargo's package version remains `0.14.0`
-so its tested lockfile is preserved.
+The Rust sources, Cargo inputs and native tests are byte-identical to the measured
+owned-buffer batch candidate, source snapshot
+`e15c430714c4ac208f23ff576ffa37c808e9b294`. Only the Python version, wheel-test
+dependency declaration and this build note change for delivery. Cargo's package
+version remains `0.14.0` so its tested lockfile is preserved.
 
 For the exact frozen byte-level pattern in `src/rmcp_pattern.txt`, the matcher
 uses an anchored regular-expression search from the known piece boundary. It
@@ -17,10 +18,10 @@ retains noncapturing borrowed spans, the exact whitespace-suffix classification,
 full-alternative restart after withholding the final whitespace scalar, match
 order, UTF-8 boundaries and each special-delimited segment's end. The matcher
 configuration, feature union and 128 per-thread matcher clones are preserved.
-Every other pattern uses the original fancy-regex implementation. Python
-encoding interfaces, special-token handling and BPE merging are unchanged.
+Every other pattern uses the original fancy-regex implementation. The public
+Python `Encoding` interface, special-token handling and BPE merging are unchanged.
 
-## Measured prototype scope
+## Earlier anchored-matcher evidence
 
 The experiment used fixed RMCP main
 `6b4ae00487812e85d51d2a13f21b28a1d863cce0`, CPython 3.12.11, Linux x86-64 and
@@ -49,9 +50,9 @@ as a successful wrapper run.
 The retained evidence is `packing-native-anchored-main6b4a-20261007-v1`:
 `closeout-v1.json`, `comparison-archive-v1/independent-terminal-review-v1.json`
 and `independent-correctness-review-v1.json`. Their immutable identities are
-recorded in the delivery source receipt outside this repository. This packaging
-step has not built or installed `0.14.0+rmcp.2`; its ordinary source build,
-installation and exact RMCP integration gate remain required before adoption.
+recorded in the delivery source receipt outside this repository. These historical
+measurements concern the anchored matcher; the owned-buffer batch comparison is
+reported separately below.
 
 ## Build
 
@@ -63,12 +64,16 @@ committed Cargo lock is included in source distributions and enforced for every
 Cargo command issued by setuptools-rust. The Python build requirements are
 pinned in `pyproject.toml`; wheel builds use the release profile.
 
+The cibuildwheel test setup declares NumPy alongside pytest and Hypothesis for
+the owned-buffer extension tests. NumPy is a test-only dependency in this delivery;
+the package's runtime dependencies are unchanged.
+
 ```sh
 env SOURCE_DATE_EPOCH=1791355200 RUSTFLAGS= CARGO_ENCODED_RUSTFLAGS= \
   uv build --sdist --python 3.12.11
 env SOURCE_DATE_EPOCH=1791355200 RUSTFLAGS= CARGO_ENCODED_RUSTFLAGS= \
   uv build --wheel --python 3.12.11
-cargo test --locked --release --lib rmcp_regex::tests -- --test-threads=1
+cargo test --locked --release --lib -- --test-threads=1
 ```
 
 Source installs require the native compiler toolchain. Generated wheels, build
@@ -76,3 +81,60 @@ outputs and local experiment receipts do not belong in Git. Select this
 distribution by its full immutable Git commit, rather than a floating branch.
 Source and toolchain pinning makes the build inputs explicit; it is not a claim
 of byte-identical wheels across build hosts or platforms.
+
+## Serial owned-buffer batch contract and measured screen
+
+This candidate starts at exact delivery `a4804e19fb491d12e61bb06bfa635a989c158bbd`.
+It adds only the private native method
+`CoreBPE.encode_to_tiktoken_buffers(texts, allowed_special)`. The return is a
+Python list of the existing readonly `TiktokenBuffer` owners, one for each input
+document, including empty documents. The public Python `Encoding` API remains
+unchanged. The comparison used separately identified `0.14.0+rmcp.2` experimental
+wheel overlays; this `0.14.0+rmcp.3` delivery retains their candidate implementation.
+
+PyO3 retains each immutable input through `PyBackedStr`; the serial Rust loop
+borrows its UTF-8 bytes rather than creating an additional owned `String` per
+document. Python's UTF-8 conversion/cache and the vector of Python-backed input
+owners still exist. One detached region and one allowed-special conversion feed
+the unchanged scalar `CoreBPE::encode` in input order. The first encoding error
+stops the loop and uses the scalar binding's `ValueError` message mapping. No
+later document is encoded, no partial result is returned, and no retry occurs.
+Each output `Vec<Rank>` moves into its own original buffer owner. No texts are
+concatenated, and no token-ID lists, worker threads, cache or matcher changes
+are introduced.
+
+The private caller must retain whole-frame surrogate preflight and HF fallback,
+then form NumPy views and invoke the original warnings only after all native
+encodes complete. Batch argument extraction occurs before encoding; buffer
+wrapping occurs after all encodes. Resource/allocation failure timing is not
+claimed identical to repeated scalar calls. This API itself imposes no batch
+size limit; RMCP retains its existing 64-document/1 MiB cuts and oversized
+singleton behavior.
+
+The complete native Rust `--lib` suite passed all 16 cases, including three new
+controls for scalar parity/boundaries, independent owned vectors and first-error
+short-circuiting. Seven Python extension cases in
+`tests/test_owned_batch.py` cover actual buffer bytes, readonly/lifetime behavior,
+empty inputs and strict text extraction without registry access or downloads.
+All seven passed in the candidate's 60-case focused RMCP run; the baseline passed
+the 53 common cases. The API and caller contract received independent source review.
+
+The fixed A/B/B/A complete-command screen used CPython 3.12.11 on Linux x86-64,
+16 workers per arm, and the same 2,880-shard input containing 1,356,564,136 IDs.
+A used RMCP `530bff39b48f176be7b4b27448f601cfb8caac1e` with the retained rebuilt
+`a4804e1` native wheel. B combined this native batch API with the reviewed RMCP
+bridge, content snapshot `cd5d66ba23caf3505aa364ee1ee8f083d51602ea`.
+Pooled whole-command throughput increased 6.4993% (ratio 1.064993); the opposite-order
+pair ratios were 1.059142 and 1.071235. Pooled child CPU per ID had ratio 1.004622.
+The fixed screen rules passed, and all four outputs matched every byte of the
+retained 84-file artifact and complete manifest. Original producers, verifiers
+and duplicate cleanup all closed; independent saved-result review accepted the
+comparison. Evidence remains under `native-owned-batch-screen-v1` in the external
+`packing-document-shards-mainb448-20261010-v1` evidence root.
+
+This measures the combined native API and RMCP bridge on one fixed shared-host
+cohort, including command startup and publication. It does not establish isolated
+native-call speedup, 500B-token throughput, GPU behavior or full RMCP qualification.
+The new-version source artifact still requires an ordinary build/install, its
+native extension controls and the exact locked RMCP integration gate before
+adoption; the measured wheel overlays do not satisfy that delivery qualification.

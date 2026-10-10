@@ -458,6 +458,20 @@ impl CoreBPE {
         Ok((ret, last_piece_token_len))
     }
 
+    #[cfg(any(feature = "python", test))]
+    fn encode_batch_serial<'a>(
+        &self,
+        texts: impl Iterator<Item = &'a str>,
+        allowed_special: &HashSet<&str>,
+    ) -> Result<Vec<Vec<Rank>>, EncodeError> {
+        let mut rows = Vec::with_capacity(texts.size_hint().0);
+        for text in texts {
+            let (tokens, _) = self.encode(text, allowed_special)?;
+            rows.push(tokens);
+        }
+        Ok(rows)
+    }
+
     fn _increase_last_piece_token_len(
         &self,
         tokens: Vec<Rank>,
@@ -692,6 +706,92 @@ impl CoreBPE {
     pub fn encode_with_special_tokens(&self, text: &str) -> Vec<Rank> {
         let allowed_special = self.special_tokens();
         self.encode(text, &allowed_special).unwrap().0
+    }
+}
+
+#[cfg(test)]
+mod owned_batch_tests {
+    use std::collections::HashSet;
+
+    use fancy_regex::RegexBuilder;
+    use rustc_hash::FxHashMap as HashMap;
+
+    use crate::{CoreBPE, MAX_NUM_THREADS, Rank};
+
+    fn core(pattern: &str) -> CoreBPE {
+        let mut ranks: HashMap<Vec<u8>, Rank> = (0_u16..256)
+            .map(|byte| (vec![byte as u8], byte as Rank))
+            .collect();
+        for (index, piece) in [b"ab".as_slice(), b"abc", b"aa", b"  "].iter().enumerate() {
+            ranks.insert(piece.to_vec(), 256 + index as Rank);
+        }
+        CoreBPE::new_internal(
+            ranks,
+            HashMap::from_iter([("<S>".to_owned(), 300), ("<T>".to_owned(), 301)]),
+            pattern,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn serial_batch_preserves_document_boundaries_and_specials() {
+        let texts = ["", "a", "b", "ab", "abc", "a b", " 's\r\n", "é😀\0", "<S>aa<T>"];
+        for pattern in [include_str!("rmcp_pattern.txt"), r"[\s\S]+"] {
+            let model = core(pattern);
+            for allowed in [HashSet::new(), HashSet::from(["<S>", "<T>"])] {
+                let expected: Vec<_> = texts
+                    .iter()
+                    .map(|text| model.encode(text, &allowed).unwrap().0)
+                    .collect();
+                let actual = model.encode_batch_serial(texts.into_iter(), &allowed).unwrap();
+                assert_eq!(actual, expected);
+                for (text, row) in texts.iter().zip(&actual) {
+                    assert_eq!(model.decode_bytes(row).unwrap(), text.as_bytes());
+                }
+                assert_eq!(actual[1], [b'a' as Rank]);
+                assert_eq!(actual[2], [b'b' as Rank]);
+                assert_eq!(actual[3], [256]);
+            }
+        }
+    }
+
+    #[test]
+    fn serial_batch_keeps_empty_rows_and_independent_owned_vectors() {
+        let model = core(r"[\s\S]+");
+        let allowed = HashSet::new();
+        assert!(model.encode_batch_serial(std::iter::empty(), &allowed).unwrap().is_empty());
+        let mut rows = model
+            .encode_batch_serial(["", "ab", "ab", ""].into_iter(), &allowed)
+            .unwrap();
+        drop(model);
+        assert_eq!(rows, [vec![], vec![256], vec![256], vec![]]);
+        assert_ne!(rows[1].as_ptr(), rows[2].as_ptr());
+        rows[1][0] = 7;
+        assert_eq!(rows[2], [256]);
+    }
+
+    #[test]
+    fn serial_batch_stops_at_first_error_without_advancing_input() {
+        let mut model = core(r"(?i)(a|b|ab)*(?>c)");
+        // The dependency's bounded backtracking-error fixture, with seeking
+        // disabled so its prefilter cannot skip the deliberately failing input.
+        let regex = RegexBuilder::new(r"(?i)(a|b|ab)*(?>c)")
+            .backtrack_limit(100_000)
+            .seek(false)
+            .build()
+            .unwrap();
+        model.regex_tls = vec![regex; MAX_NUM_THREADS];
+        let bad = "abababababababababababababababababababababababababababab";
+        let allowed = HashSet::new();
+        assert_eq!(model.encode("c", &allowed).unwrap().0, [b'c' as Rank]);
+        let expected = model.encode(bad, &allowed).unwrap_err();
+        let texts = ["c", bad].into_iter().chain(std::iter::once_with(|| -> &str {
+            panic!("a later document must not be requested after the first encode error")
+        }));
+        let actual = model.encode_batch_serial(texts, &allowed).unwrap_err();
+        assert_eq!(actual.message, expected.message);
+        assert!(actual.message.starts_with("Regex error while tokenizing:"));
+        assert_eq!(model.encode_batch_serial(["c"].into_iter(), &allowed).unwrap(), [vec![99]]);
     }
 }
 
