@@ -3,7 +3,7 @@
 This source starts at upstream tiktoken 0.14.0, commit
 `4e71bbe0c078468e00fefbf94b39849389f346e5`, and extends the delivered RMCP anchored
 matcher `a4804e19fb491d12e61bb06bfa635a989c158bbd`. Python distribution
-version `0.14.0+rmcp.3` identifies this delivery. The upstream MIT license is
+version `0.14.0+rmcp.3` identifies the earlier owned-buffer delivery. The upstream MIT license is
 retained.
 
 The Rust sources, Cargo inputs and native tests are byte-identical to the measured
@@ -138,3 +138,50 @@ native-call speedup, 500B-token throughput, GPU behavior or full RMCP qualificat
 The new-version source artifact still requires an ordinary build/install, its
 native extension controls and the exact locked RMCP integration gate before
 adoption; the measured wheel overlays do not satisfy that delivery qualification.
+
+
+## Direct forward lazy-DFA delivery
+
+Version `0.14.0+rmcp.4` retains the owned-buffer API and starts from exact native
+parent `1ac68e9f91c5bac465d1557fbf18ad092709d28c`. For the existing exact guarded
+pattern only, a forward lazy DFA replaces the meta-regex strategy dispatch and
+reverse search. The next match start is already known. The NFA keeps UTF-8,
+leftmost-first semantics, the 10 MiB construction limit and the 2 MiB lazy cache.
+Every other pattern still takes the original fancy-regex route.
+
+The whitespace suffix correction still withholds the final scalar when needed
+and restarts all alternatives there, including contractions. Each ordinary segment
+retains its own EOF before an allowed special. BPE, special matching, Python
+buffers and public APIs are unchanged. Each iterator holds a cache-pool guard;
+nested/concurrent iterators own separate caches, and clones share the immutable
+DFA while owning separate pools. Cargo inputs, lock and toolchain are unchanged.
+
+All 16 previous Rust semantic controls were retained, with only private matcher
+type/capture-storage adaptations. Two additional controls passed: every one of
+1,112,064 Unicode scalars with surrounding context, and nested/early-close/clone/
+concurrent cache use. Raw API comparison passed 1,587 exact outcomes (including
+matching negative outcomes), 512 positive real-document token/decode comparisons
+and 512 concurrent comparisons. Unstable completions were compared as exact sets
+because their ordering is unspecified.
+
+The fixed A1/B1/B2/A2 screen used identical RMCP `983421f8` producer source,
+CPython 3.12.11, a Ryzen 9950X, 16 processes and one native thread per process.
+Each fresh command processed 737,248 train documents and 1,356,564,136 stored IDs,
+including an unsplit 8,595,449-byte document. Command times were 65.215834 and
+67.215237 seconds for the rebuilt parent, and 54.096739 and 59.630949 seconds for
+the candidate. Pooled throughput increased 16.4458%; aggregate self/child CPU fell
+17.1334%. Both temporal pairs improved and both arms met the declared 1.15
+max/min timing-spread ceiling. All 84 complete output files matched byte for byte
+in every run; warnings and actual worker native-library mappings also matched.
+
+These are two matched pairs on one shared-host corpus with uncontrolled cache
+residency. The producer snapshot used by both arms was explicitly unqualified;
+this screen isolates the native delta and does not qualify that producer. Native
+libraries were controlled private overlays, not release wheel installations.
+Release build/install, current-main RMCP comparison and the final locked local
+gate remain separate requirements. No GPU or 500B-token throughput claim follows.
+Retained evidence is `pretrain-lean-native-mainf813-20261016-v1/`
+`native-forward-dfa-full-panel-v1`; closure SHA-256 is
+`26bf5f1092895bdaf22e5b85f34c297559cbc0727b48128a1cd47dcc24ba54a2`.
+The earlier build-directory reuse error and rejected lean-worker timing evidence
+remain retained separately; they were not used as passing measurements.

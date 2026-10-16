@@ -324,7 +324,7 @@ pub struct CoreBPE {
     decoder: HashMap<Rank, Vec<u8>>,
     special_tokens_decoder: HashMap<Rank, Vec<u8>>,
     regex_tls: Vec<Regex>,
-    regular_regex_tls: Option<Vec<regex_automata::meta::Regex>>,
+    regular_regex_tls: Option<Vec<rmcp_regex::RegularRegex>>,
     special_regex_tls: Vec<Regex>,
     sorted_token_bytes: Vec<Vec<u8>>,
 }
