@@ -138,3 +138,20 @@ native-call speedup, 500B-token throughput, GPU behavior or full RMCP qualificat
 The new-version source artifact still requires an ordinary build/install, its
 native extension controls and the exact locked RMCP integration gate before
 adoption; the measured wheel overlays do not satisfy that delivery qualification.
+
+## Experimental guarded match-state loop
+
+The `0.14.0+rmcp.5` candidate replaces generic meta matching only for the existing
+byte-exact guarded RMCP pattern. It shares an immutable forward lazy DFA and gives
+each live iterator its own pooled cache guard. A single-pattern transition loop
+updates the last greedy match offset without branching on each match state.
+Public state APIs retain unknown-state resolution, dead/quit handling and the
+one-byte-delayed end-of-input transition. Unicode tables, whitespace/contraction
+restarts, independent allowed-special segment endings and alternative priority
+remain unchanged. Other patterns still use the original fancy-regex path; BPE,
+rank lookup, Python buffers and batching are unchanged.
+
+This is an experimental native implementation. A segmentation component result
+does not qualify complete token output, packing throughput or delivery. Native
+API controls, exact full-cache parity, complete-command comparison against the
+current pinned implementation and the final RMCP gate remain required.

@@ -4,7 +4,40 @@
 //! pattern has no contextual assertions except its penultimate whitespace
 //! branch. Its explicit Unicode tables are retained verbatim.
 
-use regex_automata::{Anchored, Input, MatchKind, meta, util::syntax};
+use std::error::Error;
+use std::panic::{RefUnwindSafe, UnwindSafe};
+use std::sync::Arc;
+
+use regex_automata::{
+    Anchored, Input, MatchError, MatchKind,
+    hybrid::dfa,
+    nfa::thompson,
+    util::{pool::{Pool, PoolGuard}, syntax},
+};
+
+type CacheFactory = Box<dyn Fn() -> dfa::Cache + Send + Sync + UnwindSafe + RefUnwindSafe>;
+
+#[derive(Debug)]
+pub(crate) struct RegularRegex {
+    dfa: Arc<dfa::DFA>,
+    caches: Pool<dfa::Cache, CacheFactory>,
+}
+
+impl RegularRegex {
+    fn from_dfa(dfa: Arc<dfa::DFA>) -> Self {
+        let shared = Arc::clone(&dfa);
+        let create: CacheFactory = Box::new(move || shared.create_cache());
+        Self { dfa, caches: Pool::new(create) }
+    }
+}
+
+impl Clone for RegularRegex {
+    fn clone(&self) -> Self {
+        // As with meta::Regex, clones share the compiled automaton but own
+        // separate cache pools. Nested/concurrent iterators hold separate guards.
+        Self::from_dfa(Arc::clone(&self.dfa))
+    }
+}
 
 const GUARDED_PATTERN: &str = include_str!("rmcp_pattern.txt");
 // Exact table in the captured HF pattern, not Rust's Unicode whitespace API.
@@ -17,31 +50,40 @@ fn is_guarded_whitespace(scalar: char) -> bool {
     )
 }
 
-// Match regex 1.13.1's string builder and its public error conversion while
-// exposing Input::anchored to the iterator. Do not enable earliest matching.
-fn build_regular_regex(pattern: &str) -> Result<meta::Regex, regex::Error> {
-    meta::Regex::builder()
+// Keep the original parser/NFA limits and public syntax/size error conversion.
+// Only the exact guarded pattern reaches this builder in production. It has no
+// assertions needing a reverse search, and every next match start is known.
+fn build_regular_regex(pattern: &str) -> Result<RegularRegex, regex::Error> {
+    let nfa = thompson::NFA::compiler()
         .configure(
-            meta::Regex::config()
+            thompson::Config::new()
                 .nfa_size_limit(Some(10 * (1 << 20)))
-                .hybrid_cache_capacity(2 * (1 << 20))
-                .match_kind(MatchKind::LeftmostFirst)
-                .utf8_empty(true),
+                .which_captures(thompson::WhichCaptures::None)
+                .utf8(true),
         )
         .syntax(syntax::Config::default().utf8(true))
         .build(pattern)
         .map_err(|error| {
             if let Some(size_limit) = error.size_limit() {
                 regex::Error::CompiledTooBig(size_limit)
-            } else if let Some(error) = error.syntax_error() {
-                regex::Error::Syntax(error.to_string())
+            } else if let Some(source) = error.source() {
+                regex::Error::Syntax(source.to_string())
             } else {
                 regex::Error::Syntax(error.to_string())
             }
-        })
+        })?;
+    let dfa = dfa::DFA::builder()
+        .configure(
+            dfa::DFA::config()
+                .match_kind(MatchKind::LeftmostFirst)
+                .cache_capacity(2 * (1 << 20)),
+        )
+        .build_from_nfa(nfa)
+        .map_err(|error| regex::Error::Syntax(error.to_string()))?;
+    Ok(RegularRegex::from_dfa(Arc::new(dfa)))
 }
 
-pub(crate) fn compile_if_guarded(pattern: &str) -> Result<Option<meta::Regex>, regex::Error> {
+pub(crate) fn compile_if_guarded(pattern: &str) -> Result<Option<RegularRegex>, regex::Error> {
     if pattern != GUARDED_PATTERN {
         return Ok(None);
     }
@@ -57,6 +99,46 @@ pub(crate) fn compile_if_guarded(pattern: &str) -> Result<Option<meta::Regex>, r
         return Err(invalid());
     }
     build_regular_regex(&format!("{prefix}|{whitespace}")).map(Some)
+}
+
+/// Single-pattern anchored longest continuation. The DFA retains leftmost-first
+/// alternative priority. A match is delayed by one byte; EOI is a real transition.
+/// Public next_state resolves unknown states and preserves cache-owned state IDs.
+/// The exact guarded builder uses no start specialization, prefilter, or cache
+/// give-up limits. Slice restarts are valid only for this context-free pattern.
+#[inline(never)]
+fn match_state_search(
+    dfa: &dfa::DFA,
+    cache: &mut dfa::Cache,
+    text: &str,
+) -> Result<Option<usize>, MatchError> {
+    let input = Input::new(text).anchored(Anchored::Yes);
+    let mut sid = dfa.start_state_forward(cache, &input)?;
+    let mut matched = usize::MAX;
+    cache.search_start(0);
+    for (at, byte) in text.bytes().enumerate() {
+        cache.search_update(at);
+        sid = dfa
+            .next_state(cache, sid, byte)
+            .map_err(|_| MatchError::gave_up(at))?;
+        // Keep the greedy offset update as a conditional select in this hot loop.
+        matched = if sid.is_match() { at } else { matched };
+        if sid.is_dead() {
+            cache.search_finish(at);
+            return Ok((matched != usize::MAX).then_some(matched));
+        }
+        if sid.is_quit() {
+            cache.search_finish(at);
+            return Err(MatchError::quit(byte, at));
+        }
+    }
+    cache.search_update(text.len());
+    sid = dfa
+        .next_eoi_state(cache, sid)
+        .map_err(|_| MatchError::gave_up(text.len()))?;
+    matched = if sid.is_match() { text.len() } else { matched };
+    cache.search_finish(text.len());
+    Ok((matched != usize::MAX).then_some(matched))
 }
 
 pub(crate) enum Pieces<'r, 't, I> {
@@ -79,21 +161,19 @@ where
 }
 
 pub(crate) struct RegularPieces<'r, 't> {
-    regex: &'r meta::Regex,
+    regex: &'r RegularRegex,
     text: &'t str,
-    base: usize,
-    matches: meta::FindMatches<'r, 't>,
+    input: Input<'t>,
+    cache: PoolGuard<'r, dfa::Cache, CacheFactory>,
 }
 
 impl<'r, 't> RegularPieces<'r, 't> {
-    pub(crate) fn new(regex: &'r meta::Regex, text: &'t str) -> Self {
+    pub(crate) fn new(regex: &'r RegularRegex, text: &'t str) -> Self {
         Self {
             regex,
             text,
-            base: 0,
-            // The guarded alternatives cover each next scalar. Anchoring
-            // supplies the known start and keeps one cache for the iterator.
-            matches: regex.find_iter(Input::new(text).anchored(Anchored::Yes)),
+            input: Input::new(text).anchored(Anchored::Yes),
+            cache: regex.caches.get(),
         }
     }
 }
@@ -102,17 +182,19 @@ impl<'t> Iterator for RegularPieces<'_, 't> {
     type Item = &'t str;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let matched = self.matches.next()?;
-        let start = self.base + matched.start();
-        let mut end = self.base + matched.end();
+        let start = self.input.start();
+        if start == self.text.len() {
+            return None;
+        }
+        // No quit bytes, word boundaries, or cache give-up limits are enabled;
+        // this exact nonempty pattern covers each scalar at the anchored start.
+        let matched = match_state_search(&self.regex.dfa, &mut self.cache, &self.text[start..])
+            .expect("guarded forward DFA cannot quit")?;
+        let mut end = start + matched;
 
-        // At the end of this ordinary segment, the original negative lookahead
-        // succeeds, even when an allowed special follows in the full input.
-        // Otherwise its greedy whitespace branch withholds the final scalar
-        // only when at least two whitespace scalars are available. A single
-        // scalar is consumed by the original final whitespace alternative.
-        // Only the whitespace alternative can end in this exact table: the
-        // earlier L/N/other alternatives end outside it, as do contractions.
+        // EOF belongs to this ordinary segment even if an allowed special
+        // follows. Otherwise withhold the final whitespace scalar exactly as
+        // before, then restart ALL alternatives there (including contractions).
         if end < self.text.len() {
             let (final_offset, final_scalar) = self.text[start..end]
                 .char_indices()
@@ -120,15 +202,9 @@ impl<'t> Iterator for RegularPieces<'_, 't> {
                 .expect("the guarded alternatives are nonempty");
             if is_guarded_whitespace(final_scalar) && final_offset > 0 {
                 end = start + final_offset;
-                // Restart ALL alternatives at the withheld scalar. Attaching it
-                // to the next existing match is wrong before contractions.
-                // Slice restart is valid only for this context-free pattern.
-                self.base = end;
-                self.matches = self.regex.find_iter(
-                    Input::new(&self.text[end..]).anchored(Anchored::Yes),
-                );
             }
         }
+        self.input.set_start(end);
         Some(&self.text[start..end])
     }
 }
@@ -136,22 +212,23 @@ impl<'t> Iterator for RegularPieces<'_, 't> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::sync::Arc;
 
-    use regex_automata::{Anchored, meta};
+    use regex_automata::Anchored;
 
-    use super::{GUARDED_PATTERN, RegularPieces, build_regular_regex, compile_if_guarded, is_guarded_whitespace};
+    use super::{GUARDED_PATTERN, RegularRegex, RegularPieces, build_regular_regex, compile_if_guarded, is_guarded_whitespace};
     use crate::{CoreBPE, HashMap, Rank};
 
     const GUARDED_WHITESPACE: &str = r"\x{9}-\x{d}\x{20}\x{85}\x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}-\x{2029}\x{202f}\x{205f}\x{3000}";
 
-    fn matchers() -> (fancy_regex::Regex, meta::Regex) {
+    fn matchers() -> (fancy_regex::Regex, RegularRegex) {
         (
             fancy_regex::Regex::new(GUARDED_PATTERN).unwrap(),
             compile_if_guarded(GUARDED_PATTERN).unwrap().unwrap(),
         )
     }
 
-    fn assert_spans_equal(original: &fancy_regex::Regex, regular: &meta::Regex, text: &str) {
+    fn assert_spans_equal(original: &fancy_regex::Regex, regular: &RegularRegex, text: &str) {
         let expected: Vec<_> = original
             .find_iter(text)
             .map(|matched| {
@@ -219,8 +296,8 @@ mod tests {
     #[test]
     fn last_scalar_identifies_whitespace_without_capture_groups() {
         let (original, regular) = matchers();
-        // Group zero only: no named or unnamed captures are compiled.
-        assert_eq!(regular.captures_len(), 1);
+        // The forward DFA needs no capture slots, including group zero.
+        assert_eq!(regular.dfa.get_nfa().group_info().all_group_len(), 0);
         for scalar in [
             '\u{9}', '\u{a}', '\u{b}', '\u{c}', '\u{d}', ' ', '\u{85}', '\u{a0}', '\u{1680}',
             '\u{2000}', '\u{2001}', '\u{2002}', '\u{2003}', '\u{2004}', '\u{2005}',
@@ -230,8 +307,7 @@ mod tests {
         ] {
             for suffix in ["", "a", "1", "!", "'s", "'re", "'S", "<S>"] {
                 let text = format!("a{scalar} {scalar}{suffix}");
-                for matched in regular.find_iter(&text) {
-                    let piece = &text[matched.range()];
+                for piece in RegularPieces::new(&regular, &text) {
                     let last = piece.chars().next_back().unwrap();
                     assert_eq!(is_guarded_whitespace(last), piece.chars().all(is_guarded_whitespace), "piece {piece:?}");
                 }
@@ -289,7 +365,7 @@ mod tests {
 
     #[test]
     fn bounded_exhaustive_actual_pattern_spans_match() {
-        fn visit(original: &fancy_regex::Regex, regular: &meta::Regex, text: &mut String, remaining: usize) -> usize {
+        fn visit(original: &fancy_regex::Regex, regular: &RegularRegex, text: &mut String, remaining: usize) -> usize {
             assert_spans_equal(original, regular, text);
             let mut count = 1;
             if remaining > 0 {
@@ -332,10 +408,10 @@ mod tests {
         let mut actual = Vec::new();
         let mut saw_restart = false;
         loop {
-            assert_eq!(pieces.matches.input().get_anchored(), Anchored::Yes);
-            assert!(!pieces.matches.input().get_earliest());
+            assert_eq!(pieces.input.get_anchored(), Anchored::Yes);
+            assert!(!pieces.input.get_earliest());
             let Some(piece) = pieces.next() else { break };
-            saw_restart |= pieces.base > 0;
+            saw_restart |= piece == " " && text[pieces.input.start()..].starts_with(" ");
             actual.push(piece);
         }
         assert!(saw_restart);
@@ -357,4 +433,97 @@ mod tests {
             assert_eq!(actual, expected);
         }
     }
+
+    #[test]
+    fn forward_caches_survive_nested_early_close_and_concurrent_use() {
+        let (_, regular) = matchers();
+        let regular = Arc::new(regular);
+        let texts = ["", "aa11!!bb  's\u{3000}\u{a0}é  ", "\t 's", "é中文😀\0", " a  "];
+        let original = fancy_regex::Regex::new(GUARDED_PATTERN).unwrap();
+        let expected: Vec<Vec<String>> = texts.iter().map(|text| original.find_iter(text)
+            .map(|m| m.unwrap().as_str().to_owned()).collect()).collect();
+        let clone = regular.as_ref().clone();
+        assert!(Arc::ptr_eq(&regular.dfa, &clone.dfa));
+        // Keep one pooled cache checked out while another iterator comes and goes.
+        let mut held = RegularPieces::new(&regular, texts[1]);
+        assert_eq!(held.next(), Some("aa"));
+        let mut early = RegularPieces::new(&regular, texts[2]);
+        assert_eq!(early.next(), Some("\t"));
+        drop(early);
+        for (text, wanted) in texts.iter().zip(&expected) {
+            assert_eq!(RegularPieces::new(&clone, text).collect::<Vec<_>>(), *wanted);
+        }
+        let handles: Vec<_> = (0..16).map(|_| {
+            let regular = Arc::clone(&regular);
+            let expected = expected.clone();
+            std::thread::spawn(move || {
+                for _ in 0..64 {
+                    for (text, wanted) in texts.iter().zip(&expected) {
+                        assert_eq!(RegularPieces::new(&regular, text).collect::<Vec<_>>(), *wanted);
+                    }
+                }
+            })
+        }).collect();
+        for handle in handles { handle.join().unwrap(); }
+        let tail: String = held.collect();
+        assert_eq!(format!("aa{tail}"), texts[1]);
+        let joined = texts.join("");
+        assert_spans_equal(&original, &regular, &joined);
+    }
+
+    #[test]
+    fn direct_forward_matches_every_unicode_scalar_with_surrounding_context() {
+        let (original, regular) = matchers();
+        let mut count = 0;
+        for scalar in (0..=0x10ffff).filter_map(char::from_u32) {
+            let text = format!("a{scalar}  's");
+            assert_spans_equal(&original, &regular, &text);
+            count += 1;
+        }
+        assert_eq!(count, 1_112_064);
+    }
+
+    #[test]
+    fn match_state_search_preserves_priority_empty_input_and_error_offsets() {
+        use regex_automata::{Input, hybrid::dfa};
+
+        for pattern in [
+            "a", "a|ab", "ab|a", "a+", "a+?", "a$", "a.*b", "a.*?b", "[a-z]+",
+        ] {
+            let dfa = dfa::DFA::new(pattern).unwrap();
+            let mut original = dfa.create_cache();
+            let mut candidate = dfa.create_cache();
+            for text in ["", "a", "ab", "aaab!", "axbxby", " a", "a\na", "aé"] {
+                let expected = dfa
+                    .try_search_fwd(&mut original, &Input::new(text).anchored(Anchored::Yes))
+                    .map(|m| m.map(|m| m.offset()));
+                let actual = super::match_state_search(&dfa, &mut candidate, text);
+                assert_eq!(
+                    format!("{expected:?}"),
+                    format!("{actual:?}"),
+                    "{pattern} {text:?}"
+                );
+            }
+        }
+        let dfa = dfa::DFA::builder()
+            .configure(dfa::DFA::config().quit(b'!', true))
+            .build("a+")
+            .unwrap();
+        for text in ["!a", "a!", "aa", ""] {
+            let expected = dfa
+                .try_search_fwd(
+                    &mut dfa.create_cache(),
+                    &Input::new(text).anchored(Anchored::Yes),
+                )
+                .map(|m| m.map(|m| m.offset()));
+            let actual = super::match_state_search(&dfa, &mut dfa.create_cache(), text);
+            assert_eq!(
+                format!("{expected:?}"),
+                format!("{actual:?}"),
+                "quit {text:?}"
+            );
+        }
+    }
+
+
 }
