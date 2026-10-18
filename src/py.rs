@@ -65,7 +65,7 @@ impl CoreBPE {
             Err(e) => return Err(PyErr::new::<exceptions::PyValueError, _>(e.message)),
         };
 
-        let buffer = TiktokenBuffer { tokens };
+        let buffer = TiktokenBuffer::new(tokens);
         buffer.into_py_any(py)
     }
 
@@ -85,7 +85,7 @@ impl CoreBPE {
             Err(e) => return Err(PyErr::new::<exceptions::PyValueError, _>(e.message)),
         };
         rows.into_iter()
-            .map(|tokens| TiktokenBuffer { tokens }.into_py_any(py))
+            .map(|tokens| TiktokenBuffer::new(tokens).into_py_any(py))
             .collect()
     }
 
@@ -206,7 +206,19 @@ impl CoreBPE {
 #[pyclass(frozen)]
 struct TiktokenBuffer {
     tokens: Vec<Rank>,
+    length: isize,
 }
+
+impl TiktokenBuffer {
+    fn new(tokens: Vec<Rank>) -> Self {
+        Self {
+            length: tokens.len() as isize,
+            tokens,
+        }
+    }
+}
+
+static RANK_ITEMSIZE: isize = std::mem::size_of::<Rank>() as isize;
 
 #[pymethods]
 impl TiktokenBuffer {
@@ -228,25 +240,26 @@ impl TiktokenBuffer {
             let view_ref = &mut *view;
             view_ref.obj = slf.clone().into_any().into_ptr();
 
-            let data = &slf.borrow().tokens;
-            view_ref.buf = data.as_ptr() as *mut std::os::raw::c_void;
-            view_ref.len = (data.len() * std::mem::size_of::<Rank>()) as isize;
+            let data = slf.get();
+            view_ref.buf = data.tokens.as_ptr() as *mut std::os::raw::c_void;
+            view_ref.len = data.length * RANK_ITEMSIZE;
             view_ref.readonly = 1;
-            view_ref.itemsize = std::mem::size_of::<Rank>() as isize;
+            view_ref.itemsize = RANK_ITEMSIZE;
             view_ref.format = if (flags & pyo3::ffi::PyBUF_FORMAT) == pyo3::ffi::PyBUF_FORMAT {
-                let msg = std::ffi::CString::new("I").unwrap();
-                msg.into_raw()
+                c"I".as_ptr().cast_mut()
             } else {
                 std::ptr::null_mut()
             };
             view_ref.ndim = 1;
             view_ref.shape = if (flags & pyo3::ffi::PyBUF_ND) == pyo3::ffi::PyBUF_ND {
-                &mut view_ref.len
+                // The owner is frozen and retained by view_ref.obj. Shape counts
+                // elements, not bytes, and must survive copies of Py_buffer.
+                std::ptr::from_ref(&data.length).cast_mut()
             } else {
                 std::ptr::null_mut()
             };
             view_ref.strides = if (flags & pyo3::ffi::PyBUF_STRIDES) == pyo3::ffi::PyBUF_STRIDES {
-                &mut view_ref.itemsize
+                std::ptr::from_ref(&RANK_ITEMSIZE).cast_mut()
             } else {
                 std::ptr::null_mut()
             };
@@ -255,16 +268,6 @@ impl TiktokenBuffer {
         }
 
         Ok(())
-    }
-
-    unsafe fn __releasebuffer__(&self, view: *mut pyo3::ffi::Py_buffer) {
-        // Note that Py_buffer doesn't have a Drop impl
-        unsafe {
-            let view_ref = &mut *view;
-            if !view_ref.format.is_null() {
-                std::mem::drop(std::ffi::CString::from_raw(view_ref.format));
-            }
-        }
     }
 }
 
