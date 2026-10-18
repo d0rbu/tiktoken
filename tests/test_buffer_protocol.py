@@ -57,7 +57,9 @@ def test_buffer_shape_bytes_and_readonly_consumers(text: str, batch: bool) -> No
     assert view.tolist() == expected
     assert view.tobytes() == struct.pack(f"={len(expected)}I", *expected)
     assert np.asarray(buffer).tolist() == expected
-    assert np.frombuffer(buffer, dtype=np.uint32).tolist() == expected
+    array = np.frombuffer(buffer, dtype=np.uint32)
+    assert array.tolist() == expected
+    assert isinstance(array.base, memoryview) and array.base.obj is buffer
     assert not np.asarray(buffer).flags.writeable
     with pytest.raises(TypeError):
         view[0:0] = b""

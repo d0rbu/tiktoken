@@ -269,6 +269,11 @@ impl TiktokenBuffer {
 
         Ok(())
     }
+
+    unsafe fn __releasebuffer__(&self, _view: *mut pyo3::ffi::Py_buffer) {
+        // Metadata is static or retained by the frozen owner. Keep this slot:
+        // NumPy uses its presence to retain the original memoryview-based owner.
+    }
 }
 
 #[pymodule(gil_used = false)]
