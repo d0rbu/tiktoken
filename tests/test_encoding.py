@@ -152,7 +152,7 @@ def test_basic_roundtrip(make_enc):
 def test_hyp_roundtrip(make_enc: Callable[[], tiktoken.Encoding], text):
     enc = make_enc()
 
-    assert text == enc.decode(enc.encode(text))
+    assert text == enc.decode(enc.encode(text, disallowed_special=()))
 
 
 @pytest.mark.parametrize("make_enc", ENCODING_FACTORIES)
@@ -262,3 +262,18 @@ def test_hyp_batch_roundtrip(make_enc: Callable[[], tiktoken.Encoding], batch):
     assert encoded == [enc.encode(t, allowed_special="all") for t in batch]
     decoded = enc.decode_batch(encoded)
     assert decoded == batch
+
+
+@pytest.mark.parametrize(
+    "name,literal,expected_ids",
+    [
+        ("r50k_base", "<|endoftext|>", [27, 91, 437, 1659, 5239, 91, 29]),
+        ("cl100k_base", "<|fim_middle|>", [27, 91, 69, 318, 63680, 91, 29]),
+    ],
+)
+def test_reserved_literal_policy(name, literal, expected_ids):
+    enc = tiktoken.get_encoding(name)
+    with pytest.raises(ValueError, match="Encountered text corresponding to disallowed special token"):
+        enc.encode(literal)
+    assert enc.encode(literal, disallowed_special=()) == expected_ids
+    assert enc.decode(expected_ids) == literal

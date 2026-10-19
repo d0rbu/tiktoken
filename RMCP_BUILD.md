@@ -1,5 +1,28 @@
 # RMCP native owned-buffer batch build
 
+## Count-only delivery (`0.14.0+rmcp.6`)
+
+The private `CoreBPE.count_tokens(text, allowed_special)` binding returns the
+encoded length for complete byte vocabularies. It shares the ordinary encoder's
+piece traversal, special-token handling and merge boundaries. Short pieces need
+only their merge-boundary count; long pieces retain the existing encoder. Normal
+encoding still returns the same IDs and last-piece length. The count operation
+does not claim support for incomplete byte vocabularies.
+
+This change follows the existing match-state and buffer-metadata branch at
+`b982c3b689b51c72969e0387884b7eee274b4573`; those implementations are unchanged.
+Native tests compare counts with encoded IDs across Unicode, special tokens,
+small/large-piece boundaries and errors. The generic arbitrary-text roundtrip
+test explicitly treats reserved-token spellings as ordinary text, with separate
+controls retaining default rejection and explicitly allowed special IDs.
+
+The earlier render prototype used a different native matcher. Its measurements
+do not qualify this delivery; source-specific RMCP parity and timing checks are
+required before adoption. The historical build and measurement notes below
+retain their original source boundaries.
+
+## Original owned-buffer delivery
+
 This source starts at upstream tiktoken 0.14.0, commit
 `4e71bbe0c078468e00fefbf94b39849389f346e5`, and extends the delivered RMCP anchored
 matcher `a4804e19fb491d12e61bb06bfa635a989c158bbd`. Python distribution

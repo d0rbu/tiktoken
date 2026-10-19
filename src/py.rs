@@ -48,6 +48,21 @@ impl CoreBPE {
         })
     }
 
+    #[pyo3(name = "count_tokens")]
+    fn py_count_tokens(
+        &self,
+        py: Python,
+        text: &str,
+        allowed_special: HashSet<PyBackedStr>,
+    ) -> PyResult<usize> {
+        py.detach(|| {
+            let allowed_special: HashSet<&str> =
+                allowed_special.iter().map(|s| s.as_ref()).collect();
+            self.count_tokens(text, &allowed_special)
+                .map_err(|e| PyErr::new::<exceptions::PyValueError, _>(e.message))
+        })
+    }
+
     fn encode_to_tiktoken_buffer(
         &self,
         py: Python,
