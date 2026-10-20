@@ -6,3 +6,5 @@ global-include py.typed
 recursive-include scripts *.py
 recursive-include tests *.py
 recursive-include src *.rs
+include src/rmcp_pattern.txt
+include Cargo.lock

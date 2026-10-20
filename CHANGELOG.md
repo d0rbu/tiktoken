@@ -2,6 +2,12 @@
 
 This is the changelog for the open source version of tiktoken.
 
+## Unreleased RMCP changes
+- Count tokens without constructing output IDs for RMCP's admitted complete byte vocabularies.
+- Correct native token-buffer shapes to count uint32 elements rather than bytes.
+- Keep exported shape and stride metadata valid when a consumer copies its buffer descriptor.
+- Reuse a static format descriptor instead of allocating it for each buffer view.
+
 ## [v0.14.0]
 - Build wheels for Python 3.15
 - Support looking up more GPT-5 series models

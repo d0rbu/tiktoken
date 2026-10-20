@@ -10,6 +10,8 @@ setup(
             # Between our use of editable installs and wanting to use Rust for performance sensitive
             # code, it makes sense to just always use --release
             debug=False,
+            cargo_manifest_args=["--locked"],
+            rust_version=">=1.90.0",
             features=["python"],
         )
     ],

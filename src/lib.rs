@@ -9,6 +9,7 @@ use rustc_hash::FxHashMap as HashMap;
 
 #[cfg(feature = "python")]
 mod py;
+mod rmcp_regex;
 
 pub type Rank = u32;
 
@@ -323,6 +324,7 @@ pub struct CoreBPE {
     decoder: HashMap<Rank, Vec<u8>>,
     special_tokens_decoder: HashMap<Rank, Vec<u8>>,
     regex_tls: Vec<Regex>,
+    regular_regex_tls: Option<Vec<rmcp_regex::RegularRegex>>,
     special_regex_tls: Vec<Regex>,
     sorted_token_bytes: Vec<Vec<u8>>,
 }
@@ -337,6 +339,23 @@ impl CoreBPE {
 
     fn _get_tl_special_regex(&self) -> &Regex {
         &self.special_regex_tls[hash_current_thread() % MAX_NUM_THREADS]
+    }
+
+    fn _ordinary_pieces<'a>(
+        &'a self,
+        text: &'a str,
+    ) -> impl Iterator<Item = Result<&'a str, fancy_regex::Error>> {
+        match &self.regular_regex_tls {
+            Some(regexes) => rmcp_regex::Pieces::Regular(rmcp_regex::RegularPieces::new(
+                &regexes[hash_current_thread() % MAX_NUM_THREADS],
+                text,
+            )),
+            None => rmcp_regex::Pieces::Original(
+                self._get_tl_regex()
+                    .find_iter(text)
+                    .map(|matched| matched.map(|matched| matched.as_str())),
+            ),
+        }
     }
 
     /// Decodes tokens into a list of bytes.
@@ -360,10 +379,9 @@ impl CoreBPE {
     pub fn encode_ordinary(&self, text: &str) -> Vec<Rank> {
         // This is the core of the encoding logic; the other functions in here
         // just make things complicated :-)
-        let regex = self._get_tl_regex();
         let mut ret = vec![];
-        for mat in regex.find_iter(text) {
-            let piece = mat.unwrap().as_str().as_bytes();
+        for piece in self._ordinary_pieces(text) {
+            let piece = piece.unwrap().as_bytes();
             match self.encoder.get(piece) {
                 Some(token) => ret.push(*token),
                 None => ret.extend(&byte_pair_encode(piece, &self.encoder)),
@@ -377,9 +395,28 @@ impl CoreBPE {
         text: &str,
         allowed_special: &HashSet<&str>,
     ) -> Result<(Vec<Rank>, usize), EncodeError> {
+        self.encode_with_count::<false>(text, allowed_special)
+            .map(|(tokens, last_piece, _)| (tokens, last_piece))
+    }
+
+    /// Count tokens for complete byte vocabularies without materializing output IDs.
+    pub fn count_tokens(
+        &self,
+        text: &str,
+        allowed_special: &HashSet<&str>,
+    ) -> Result<usize, EncodeError> {
+        self.encode_with_count::<true>(text, allowed_special)
+            .map(|(_, _, count)| count)
+    }
+
+    fn encode_with_count<const COUNT_ONLY: bool>(
+        &self,
+        text: &str,
+        allowed_special: &HashSet<&str>,
+    ) -> Result<(Vec<Rank>, usize, usize), EncodeError> {
         let special_regex = self._get_tl_special_regex();
-        let regex = self._get_tl_regex();
         let mut ret = vec![];
+        let mut count = 0;
 
         let mut start = 0;
         let mut last_piece_token_len = 0;
@@ -402,9 +439,9 @@ impl CoreBPE {
             let end = next_special.map_or(text.len(), |m| m.start());
 
             // Okay, here we go, compare this logic to encode_ordinary
-            for mat_res in regex.find_iter(&text[start..end]) {
-                let mat = match mat_res {
-                    Ok(m) => m,
+            for piece_res in self._ordinary_pieces(&text[start..end]) {
+                let piece = match piece_res {
+                    Ok(piece) => piece,
                     Err(e) => {
                         return Err(EncodeError {
                             message: format!("Regex error while tokenizing: {e}"),
@@ -412,15 +449,29 @@ impl CoreBPE {
                     }
                 };
 
-                let piece = mat.as_str().as_bytes();
+                let piece = piece.as_bytes();
                 if let Some(token) = self.encoder.get(piece) {
                     last_piece_token_len = 1;
-                    ret.push(*token);
+                    if COUNT_ONLY {
+                        count += 1;
+                    } else {
+                        ret.push(*token);
+                    }
                     continue;
                 }
-                let tokens = byte_pair_encode(piece, &self.encoder);
-                last_piece_token_len = tokens.len();
-                ret.extend(&tokens);
+                if COUNT_ONLY && piece.len() > 1 && piece.len() < 100 {
+                    // Complete byte vocabularies need only the same merge boundaries.
+                    last_piece_token_len = _byte_pair_merge(&self.encoder, piece).len() - 1;
+                    count += last_piece_token_len;
+                } else {
+                    let tokens = byte_pair_encode(piece, &self.encoder);
+                    last_piece_token_len = tokens.len();
+                    if COUNT_ONLY {
+                        count += tokens.len();
+                    } else {
+                        ret.extend(&tokens);
+                    }
+                }
             }
 
             match next_special {
@@ -428,7 +479,11 @@ impl CoreBPE {
                 Some(m) => {
                     let piece = m.as_str();
                     let token = self.special_tokens_encoder[piece];
-                    ret.push(token);
+                    if COUNT_ONLY {
+                        count += 1;
+                    } else {
+                        ret.push(token);
+                    }
                     start = m.end();
                     last_piece_token_len = 0;
                 }
@@ -438,7 +493,21 @@ impl CoreBPE {
 
         // last_piece_token_len is how many tokens came from the last regex split. This is used
         // for determining unstable tokens, since you can't merge across (stable) regex splits
-        Ok((ret, last_piece_token_len))
+        Ok((ret, last_piece_token_len, count))
+    }
+
+    #[cfg(any(feature = "python", test))]
+    fn encode_batch_serial<'a>(
+        &self,
+        texts: impl Iterator<Item = &'a str>,
+        allowed_special: &HashSet<&str>,
+    ) -> Result<Vec<Vec<Rank>>, EncodeError> {
+        let mut rows = Vec::with_capacity(texts.size_hint().0);
+        for text in texts {
+            let (tokens, _) = self.encode(text, allowed_special)?;
+            rows.push(tokens);
+        }
+        Ok(rows)
     }
 
     fn _increase_last_piece_token_len(
@@ -621,6 +690,7 @@ impl CoreBPE {
         pattern: &str,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let regex = Regex::new(pattern)?;
+        let regular_regex = rmcp_regex::compile_if_guarded(pattern)?;
 
         let special_regex = {
             let parts = special_tokens_encoder
@@ -655,6 +725,8 @@ impl CoreBPE {
             decoder,
             special_tokens_decoder,
             regex_tls: (0..MAX_NUM_THREADS).map(|_| regex.clone()).collect(),
+            regular_regex_tls: regular_regex
+                .map(|regex| (0..MAX_NUM_THREADS).map(|_| regex.clone()).collect()),
             special_regex_tls: (0..MAX_NUM_THREADS)
                 .map(|_| special_regex.clone())
                 .collect(),
@@ -672,6 +744,129 @@ impl CoreBPE {
     pub fn encode_with_special_tokens(&self, text: &str) -> Vec<Rank> {
         let allowed_special = self.special_tokens();
         self.encode(text, &allowed_special).unwrap().0
+    }
+}
+
+#[cfg(test)]
+mod owned_batch_tests {
+    use std::collections::HashSet;
+
+    use fancy_regex::RegexBuilder;
+    use rustc_hash::FxHashMap as HashMap;
+
+    use crate::{CoreBPE, MAX_NUM_THREADS, Rank};
+
+    fn core(pattern: &str) -> CoreBPE {
+        let mut ranks: HashMap<Vec<u8>, Rank> = (0_u16..256)
+            .map(|byte| (vec![byte as u8], byte as Rank))
+            .collect();
+        for (index, piece) in [b"ab".as_slice(), b"abc", b"aa", b"  "].iter().enumerate() {
+            ranks.insert(piece.to_vec(), 256 + index as Rank);
+        }
+        CoreBPE::new_internal(
+            ranks,
+            HashMap::from_iter([("<S>".to_owned(), 300), ("<T>".to_owned(), 301)]),
+            pattern,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn counts_match_complete_byte_vocabularies() {
+        let mut texts = vec![
+            String::new(),
+            "a".to_owned(),
+            "ab".to_owned(),
+            "abc".to_owned(),
+            "é😀\0".to_owned(),
+            "<S>aa<T>".to_owned(),
+            "\r\n\t 're".to_owned(),
+        ];
+        for length in [2, 3, 98, 99, 100, 101, 1024] {
+            texts.push("a".repeat(length));
+            texts.push("abc".repeat(length));
+            texts.push("é".repeat(length));
+            texts.push(" ".repeat(length));
+        }
+        for pattern in [include_str!("rmcp_pattern.txt"), r"[\s\S]+"] {
+            let model = core(pattern);
+            for allowed in [
+                HashSet::new(),
+                HashSet::from(["<S>"]),
+                HashSet::from(["<S>", "<T>"]),
+            ] {
+                for text in &texts {
+                    let (ids, _) = model.encode(text, &allowed).unwrap();
+                    assert_eq!(model.count_tokens(text, &allowed).unwrap(), ids.len());
+                    assert_eq!(model.decode_bytes(&ids).unwrap(), text.as_bytes());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn serial_batch_preserves_document_boundaries_and_specials() {
+        let texts = ["", "a", "b", "ab", "abc", "a b", " 's\r\n", "é😀\0", "<S>aa<T>"];
+        for pattern in [include_str!("rmcp_pattern.txt"), r"[\s\S]+"] {
+            let model = core(pattern);
+            for allowed in [HashSet::new(), HashSet::from(["<S>", "<T>"])] {
+                let expected: Vec<_> = texts
+                    .iter()
+                    .map(|text| model.encode(text, &allowed).unwrap().0)
+                    .collect();
+                let actual = model.encode_batch_serial(texts.into_iter(), &allowed).unwrap();
+                assert_eq!(actual, expected);
+                for (text, row) in texts.iter().zip(&actual) {
+                    assert_eq!(model.decode_bytes(row).unwrap(), text.as_bytes());
+                }
+                assert_eq!(actual[1], [b'a' as Rank]);
+                assert_eq!(actual[2], [b'b' as Rank]);
+                assert_eq!(actual[3], [256]);
+            }
+        }
+    }
+
+    #[test]
+    fn serial_batch_keeps_empty_rows_and_independent_owned_vectors() {
+        let model = core(r"[\s\S]+");
+        let allowed = HashSet::new();
+        assert!(model.encode_batch_serial(std::iter::empty(), &allowed).unwrap().is_empty());
+        let mut rows = model
+            .encode_batch_serial(["", "ab", "ab", ""].into_iter(), &allowed)
+            .unwrap();
+        drop(model);
+        assert_eq!(rows, [vec![], vec![256], vec![256], vec![]]);
+        assert_ne!(rows[1].as_ptr(), rows[2].as_ptr());
+        rows[1][0] = 7;
+        assert_eq!(rows[2], [256]);
+    }
+
+    #[test]
+    fn serial_batch_stops_at_first_error_without_advancing_input() {
+        let mut model = core(r"(?i)(a|b|ab)*(?>c)");
+        // The dependency's bounded backtracking-error fixture, with seeking
+        // disabled so its prefilter cannot skip the deliberately failing input.
+        let regex = RegexBuilder::new(r"(?i)(a|b|ab)*(?>c)")
+            .backtrack_limit(100_000)
+            .seek(false)
+            .build()
+            .unwrap();
+        model.regex_tls = vec![regex; MAX_NUM_THREADS];
+        let bad = "abababababababababababababababababababababababababababab";
+        let allowed = HashSet::new();
+        assert_eq!(model.encode("c", &allowed).unwrap().0, [b'c' as Rank]);
+        let expected = model.encode(bad, &allowed).unwrap_err();
+        assert_eq!(
+            model.count_tokens(bad, &allowed).unwrap_err().message,
+            expected.message
+        );
+        let texts = ["c", bad].into_iter().chain(std::iter::once_with(|| -> &str {
+            panic!("a later document must not be requested after the first encode error")
+        }));
+        let actual = model.encode_batch_serial(texts, &allowed).unwrap_err();
+        assert_eq!(actual.message, expected.message);
+        assert!(actual.message.starts_with("Regex error while tokenizing:"));
+        assert_eq!(model.encode_batch_serial(["c"].into_iter(), &allowed).unwrap(), [vec![99]]);
     }
 }
 
