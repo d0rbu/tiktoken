@@ -8,10 +8,118 @@ use pyo3::{
 };
 use rustc_hash::FxHashMap as HashMap;
 
+use crate::rmcp_source::{Batch as SourceBatch, Cursor as SourceCursor, ReadError};
 use crate::{CoreBPE, Rank, byte_pair_encode};
+
+fn source_io_error(py: Python<'_>, error: std::io::Error, path: &str) -> PyErr {
+    if let Some(errno) = error.raw_os_error() {
+        let message = py
+            .import("os")
+            .and_then(|os| os.call_method1("strerror", (errno,)))
+            .and_then(|value| value.extract::<String>());
+        match message {
+            Ok(message) => exceptions::PyOSError::new_err((errno, message, path.to_owned())),
+            Err(error) => error,
+        }
+    } else {
+        exceptions::PyOSError::new_err(error.to_string())
+    }
+}
+
+#[pyclass]
+struct OwnedSourceCursor {
+    cursor: SourceCursor,
+    path: String,
+}
+
+#[pyclass(frozen)]
+struct OwnedSourceBatch {
+    batch: SourceBatch,
+}
+
+#[pymethods]
+impl OwnedSourceCursor {
+    fn close(&mut self) {
+        self.cursor.close();
+    }
+
+    fn read_batch(
+        &mut self,
+        py: Python<'_>,
+        provenance: bool,
+    ) -> PyResult<Option<OwnedSourceBatch>> {
+        match py.detach(|| self.cursor.batch(provenance)) {
+            Ok(batch) => Ok(batch.map(|batch| OwnedSourceBatch { batch })),
+            Err(ReadError::Io(error)) => Err(source_io_error(py, error, &self.path)),
+            Err(ReadError::Declined) => Err(exceptions::PyNotImplementedError::new_err(
+                "source batch requires the original Python decoder before encoding",
+            )),
+        }
+    }
+
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyBytes>>> {
+        match py.detach(|| self.cursor.raw_line()) {
+            Ok(line) => Ok(line.map(|line| PyBytes::new(py, &line).unbind())),
+            Err(error) => Err(source_io_error(py, error, &self.path)),
+        }
+    }
+}
+
+#[pymethods]
+impl OwnedSourceBatch {
+    #[getter]
+    fn provenance(&self) -> Vec<Option<String>> {
+        self.batch.provenance.clone()
+    }
+}
 
 #[pymethods]
 impl CoreBPE {
+    #[pyo3(signature = (path, split, start, stop=None))]
+    fn _open_source(
+        &self,
+        py: Python<'_>,
+        path: String,
+        split: String,
+        start: u64,
+        stop: Option<u64>,
+    ) -> PyResult<OwnedSourceCursor> {
+        let opened =
+            py.detach(|| SourceCursor::open(std::path::Path::new(&path), split, start, stop));
+        match opened {
+            Ok(cursor) => Ok(OwnedSourceCursor { cursor, path }),
+            Err(error) => Err(source_io_error(py, error, &path)),
+        }
+    }
+
+    fn _encode_source_batch(
+        &self,
+        py: Python<'_>,
+        batch: &OwnedSourceBatch,
+        allowed_special: HashSet<PyBackedStr>,
+        eos: Rank,
+    ) -> PyResult<(Py<PyAny>, Vec<usize>)> {
+        let result = py.detach(|| {
+            let allowed: HashSet<&str> = allowed_special.iter().map(|s| s.as_ref()).collect();
+            let rows =
+                self.encode_batch_serial(batch.batch.texts.iter().map(String::as_str), &allowed)?;
+            let lengths: Vec<usize> = rows.iter().map(|row| row.len() + 1).collect();
+            let mut ids = Vec::with_capacity(lengths.iter().sum());
+            for row in rows {
+                ids.extend(row);
+                ids.push(eos);
+            }
+            Ok::<_, crate::EncodeError>((ids, lengths))
+        });
+        let (ids, lengths) =
+            result.map_err(|error| exceptions::PyValueError::new_err(error.message))?;
+        Ok((TiktokenBuffer::new(ids).into_py_any(py)?, lengths))
+    }
+
     #[new]
     fn py_new(
         encoder: HashMap<Vec<u8>, Rank>,
