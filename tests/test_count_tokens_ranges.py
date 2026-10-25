@@ -89,3 +89,21 @@ def test_ranges_preserve_scalar_native_failure_and_leave_encoder_usable():
         model.count_tokens_ranges("ab", [(0, 1), (1, 2)], frozenset())
     assert str(ranges.value) == str(scalar.value)
     assert model.count_tokens_ranges("a", [(0, 1)], frozenset()) == [1]
+
+
+@pytest.mark.parametrize("pattern", [r"[\s\S]+", r"\s+|[^\s]+"])
+@pytest.mark.parametrize("width", [1, 2, 99, 100, 101, 1024])
+def test_repeated_bpe_misses_are_independent_of_request_order_and_special_policy(pattern, width):
+    ranks = {bytes([value]): value for value in range(256)}
+    ranks.update({b"ab": 256, b"abc": 257})
+    model = _tiktoken.CoreBPE(ranks, {"<S>": 300}, pattern)
+    piece = "ababcé🦊" * width
+    text = piece + " <S> " + piece
+    raw = text.encode()
+    # Repeated misses exercise reuse inside a range and across duplicate ranges.
+    spans = [(0, len(raw)), (0, len(raw)), (0, 0), (0, len(piece.encode()))]
+    for allowed in [frozenset(), frozenset({"<S>"}), frozenset()]:
+        expected = [len(model.encode(raw[a:b].decode(), allowed)) for a, b in spans]
+        assert model.count_tokens_ranges(text, spans, allowed) == expected
+        assert model.count_tokens_ranges(text, list(reversed(spans)), allowed) == list(reversed(expected))
+        assert model.count_tokens_ranges("", [(0, 0)], allowed) == [0]

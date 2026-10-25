@@ -395,7 +395,7 @@ impl CoreBPE {
         text: &str,
         allowed_special: &HashSet<&str>,
     ) -> Result<(Vec<Rank>, usize), EncodeError> {
-        self.encode_with_count::<false>(text, allowed_special)
+        self.encode_with_count::<false>(text, allowed_special, None)
             .map(|(tokens, last_piece, _)| (tokens, last_piece))
     }
 
@@ -405,14 +405,15 @@ impl CoreBPE {
         text: &str,
         allowed_special: &HashSet<&str>,
     ) -> Result<usize, EncodeError> {
-        self.encode_with_count::<true>(text, allowed_special)
+        self.encode_with_count::<true>(text, allowed_special, None)
             .map(|(_, _, count)| count)
     }
 
-    fn encode_with_count<const COUNT_ONLY: bool>(
-        &self,
-        text: &str,
+    fn encode_with_count<'a, const COUNT_ONLY: bool>(
+        &'a self,
+        text: &'a str,
         allowed_special: &HashSet<&str>,
+        mut piece_counts: Option<&mut HashMap<&'a [u8], usize>>,
     ) -> Result<(Vec<Rank>, usize, usize), EncodeError> {
         let special_regex = self._get_tl_special_regex();
         let mut ret = vec![];
@@ -459,6 +460,13 @@ impl CoreBPE {
                     }
                     continue;
                 }
+                if COUNT_ONLY {
+                    if let Some(cached) = piece_counts.as_deref().and_then(|cache| cache.get(piece)) {
+                        last_piece_token_len = *cached;
+                        count += *cached;
+                        continue;
+                    }
+                }
                 if COUNT_ONLY && piece.len() > 1 && piece.len() < 100 {
                     // Complete byte vocabularies need only the same merge boundaries.
                     last_piece_token_len = _byte_pair_merge(&self.encoder, piece).len() - 1;
@@ -470,6 +478,11 @@ impl CoreBPE {
                         count += tokens.len();
                     } else {
                         ret.extend(&tokens);
+                    }
+                }
+                if COUNT_ONLY {
+                    if let Some(cache) = piece_counts.as_deref_mut() {
+                        cache.insert(piece, last_piece_token_len);
                     }
                 }
             }

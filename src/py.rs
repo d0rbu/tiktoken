@@ -75,6 +75,8 @@ impl CoreBPE {
         py.detach(|| {
             let allowed_special: HashSet<&str> =
                 allowed_special.iter().map(|s| s.as_ref()).collect();
+            // Borrowed piece keys live only for this request; no cross-call state.
+            let mut piece_counts = HashMap::default();
             ranges
                 .into_iter()
                 .map(|(start, end)| {
@@ -83,7 +85,8 @@ impl CoreBPE {
                             "range must be ordered, in bounds and on UTF-8 boundaries",
                         )
                     })?;
-                    self.count_tokens(span, &allowed_special)
+                    self.encode_with_count::<true>(span, &allowed_special, Some(&mut piece_counts))
+                        .map(|(_, _, count)| count)
                         .map_err(|e| PyErr::new::<exceptions::PyValueError, _>(e.message))
                 })
                 .collect()
