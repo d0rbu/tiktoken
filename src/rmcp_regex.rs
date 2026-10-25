@@ -21,13 +21,14 @@ type CacheFactory = Box<dyn Fn() -> dfa::Cache + Send + Sync + UnwindSafe + RefU
 pub(crate) struct RegularRegex {
     dfa: Arc<dfa::DFA>,
     caches: Pool<dfa::Cache, CacheFactory>,
+    ascii_guarded: bool,
 }
 
 impl RegularRegex {
     fn from_dfa(dfa: Arc<dfa::DFA>) -> Self {
         let shared = Arc::clone(&dfa);
         let create: CacheFactory = Box::new(move || shared.create_cache());
-        Self { dfa, caches: Pool::new(create) }
+        Self { dfa, caches: Pool::new(create), ascii_guarded: false }
     }
 }
 
@@ -35,7 +36,9 @@ impl Clone for RegularRegex {
     fn clone(&self) -> Self {
         // As with meta::Regex, clones share the compiled automaton but own
         // separate cache pools. Nested/concurrent iterators hold separate guards.
-        Self::from_dfa(Arc::clone(&self.dfa))
+        let mut cloned = Self::from_dfa(Arc::clone(&self.dfa));
+        cloned.ascii_guarded = self.ascii_guarded;
+        cloned
     }
 }
 
@@ -98,7 +101,54 @@ pub(crate) fn compile_if_guarded(pattern: &str) -> Result<Option<RegularRegex>, 
     if lookahead != format!("{whitespace}(?![^{class}])") {
         return Err(invalid());
     }
-    build_regular_regex(&format!("{prefix}|{whitespace}")).map(Some)
+    let mut regex = build_regular_regex(&format!("{prefix}|{whitespace}"))?;
+    regex.ascii_guarded = true;
+    Ok(Some(regex))
+}
+
+fn ascii_class(byte: u8) -> u8 {
+    match byte {
+        b'A'..=b'Z' | b'a'..=b'z' => 1,
+        b'0'..=b'9' => 2,
+        9..=13 | b' ' => 0,
+        0..=127 => 3,
+        _ => 4,
+    }
+}
+
+/// The exact guarded alternatives on ASCII. A non-ASCII boundary delegates
+/// the entire piece, since its Unicode class can extend the current run.
+fn ascii_piece_len(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    if bytes[0] == b'\'' {
+        match bytes.get(1) {
+            Some(b's' | b't' | b'm' | b'd') => return Some(2),
+            Some(b'r' | b'v') if bytes.get(2) == Some(&b'e') => return Some(3),
+            Some(b'l') if bytes.get(2) == Some(&b'l') => return Some(3),
+            _ => {}
+        }
+    }
+    let begin = usize::from(bytes[0] == b' ' && bytes.len() > 1);
+    let class = ascii_class(bytes[begin]);
+    if class == 4 {
+        return None;
+    }
+    let mut end = begin + 1;
+    while end < bytes.len() {
+        let next = ascii_class(bytes[end]);
+        if next == 4 {
+            return None;
+        }
+        if next != class {
+            break;
+        }
+        end += 1;
+    }
+    // EOF means the end of this ordinary segment, including before a special.
+    if class == 0 && end < bytes.len() && end > 1 {
+        end -= 1;
+    }
+    Some(end)
 }
 
 /// Single-pattern anchored longest continuation. The DFA retains leftmost-first
@@ -186,6 +236,11 @@ impl<'t> Iterator for RegularPieces<'_, 't> {
         if start == self.text.len() {
             return None;
         }
+        if self.regex.ascii_guarded && let Some(length) = ascii_piece_len(&self.text[start..]) {
+            let end = start + length;
+            self.input.set_start(end);
+            return Some(&self.text[start..end]);
+        }
         // No quit bytes, word boundaries, or cache give-up limits are enabled;
         // this exact nonempty pattern covers each scalar at the anchored start.
         let matched = match_state_search(&self.regex.dfa, &mut self.cache, &self.text[start..])
@@ -220,6 +275,24 @@ mod tests {
     use crate::{CoreBPE, HashMap, Rank};
 
     const GUARDED_WHITESPACE: &str = r"\x{9}-\x{d}\x{20}\x{85}\x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}-\x{2029}\x{202f}\x{205f}\x{3000}";
+
+    #[test]
+    fn ascii_pairs_contractions_and_unicode_boundaries_match_fancy_regex() {
+        let (original, regular) = matchers();
+        assert!(regular.ascii_guarded && regular.clone().ascii_guarded);
+        assert!(!build_regular_regex("a").unwrap().ascii_guarded);
+        for left in 0..128_u8 {
+            for right in 0..128_u8 {
+                let prefix = String::from_utf8(vec![left, right]).unwrap();
+                for tail in [" 're\téX", "123!\u{3000}x"] {
+                    assert_spans_equal(&original, &regular, &format!("{prefix}{tail}"));
+                }
+            }
+        }
+        for text in ["é", "aé", "1١", "!\u{301}", " \u{3000}"] {
+            assert!(super::ascii_piece_len(text).is_none());
+        }
+    }
 
     fn matchers() -> (fancy_regex::Regex, RegularRegex) {
         (
