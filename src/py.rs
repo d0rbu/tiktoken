@@ -63,6 +63,33 @@ impl CoreBPE {
         })
     }
 
+    /// Count UTF-8 byte ranges without extracting a Python string per range.
+    #[pyo3(name = "count_tokens_ranges")]
+    fn py_count_tokens_ranges(
+        &self,
+        py: Python,
+        text: &str,
+        ranges: Vec<(usize, usize)>,
+        allowed_special: HashSet<PyBackedStr>,
+    ) -> PyResult<Vec<usize>> {
+        py.detach(|| {
+            let allowed_special: HashSet<&str> =
+                allowed_special.iter().map(|s| s.as_ref()).collect();
+            ranges
+                .into_iter()
+                .map(|(start, end)| {
+                    let span = text.get(start..end).ok_or_else(|| {
+                        PyErr::new::<exceptions::PyValueError, _>(
+                            "range must be ordered, in bounds and on UTF-8 boundaries",
+                        )
+                    })?;
+                    self.count_tokens(span, &allowed_special)
+                        .map_err(|e| PyErr::new::<exceptions::PyValueError, _>(e.message))
+                })
+                .collect()
+        })
+    }
+
     fn encode_to_tiktoken_buffer(
         &self,
         py: Python,
