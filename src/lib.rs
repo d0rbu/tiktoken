@@ -12,6 +12,8 @@ mod py;
 mod rmcp_regex;
 #[cfg(any(feature = "python", test))]
 mod rmcp_source;
+#[cfg(any(feature = "python", test))]
+mod rmcp_token_storage;
 
 pub type Rank = u32;
 
@@ -141,9 +143,21 @@ fn _byte_pair_merge_large(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<R
 }
 
 fn _byte_pair_merge(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<(usize, Rank)> {
+    let mut parts = Vec::with_capacity(piece.len() + 1);
+    _byte_pair_merge_into(ranks, piece, &mut parts);
+    parts
+}
+
+fn _byte_pair_merge_into(
+    ranks: &HashMap<Vec<u8>, Rank>,
+    piece: &[u8],
+    parts: &mut Vec<(usize, Rank)>,
+) {
+    // Reuse only this encode call's scratch; starts and ranks never carry over.
+    parts.clear();
+    parts.reserve(piece.len() + 1);
     // This is a vector of (start, rank).
     // The rank is of the pair starting at position start.
-    let mut parts = Vec::with_capacity(piece.len() + 1);
 
     // Note that we hash bytes when indexing into `ranks`, not token pairs. As long as we train BPE
     // the way we currently do, this is equivalent. An easy way to break this would be to decouple
@@ -183,9 +197,9 @@ fn _byte_pair_merge(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<(usize,
         // Update parts[i] and parts[i - 1] before removing parts[i + 1], since
         // `parts.remove(i + 1)` will thrash the cache.
         if i > 0 {
-            parts[i - 1].1 = get_rank(&parts, i - 1);
+            parts[i - 1].1 = get_rank(parts, i - 1);
         }
-        parts[i].1 = get_rank(&parts, i);
+        parts[i].1 = get_rank(parts, i);
         parts.remove(i + 1);
 
         min_rank = (Rank::MAX, usize::MAX);
@@ -195,7 +209,6 @@ fn _byte_pair_merge(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<(usize,
             }
         }
     }
-    parts
 }
 
 pub fn byte_pair_encode(piece: &[u8], ranks: &HashMap<Vec<u8>, Rank>) -> Vec<Rank> {
@@ -418,6 +431,7 @@ impl CoreBPE {
     ) -> Result<(Vec<Rank>, usize, usize), EncodeError> {
         let special_regex = self._get_tl_special_regex();
         let mut ret = vec![];
+        let mut parts = Vec::new();
         let mut count = 0;
 
         let mut start = 0;
@@ -461,10 +475,18 @@ impl CoreBPE {
                     }
                     continue;
                 }
-                if COUNT_ONLY && piece.len() > 1 && piece.len() < 100 {
-                    // Complete byte vocabularies need only the same merge boundaries.
-                    last_piece_token_len = _byte_pair_merge(&self.encoder, piece).len() - 1;
-                    count += last_piece_token_len;
+                if piece.len() > 1 && piece.len() < 100 {
+                    _byte_pair_merge_into(&self.encoder, piece, &mut parts);
+                    last_piece_token_len = parts.len() - 1;
+                    if COUNT_ONLY {
+                        count += last_piece_token_len;
+                    } else {
+                        ret.extend(
+                            parts
+                                .windows(2)
+                                .map(|part| self.encoder[&piece[part[0].0..part[1].0]]),
+                        );
+                    }
                 } else {
                     let tokens = byte_pair_encode(piece, &self.encoder);
                     last_piece_token_len = tokens.len();
@@ -804,6 +826,64 @@ mod owned_batch_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn short_merge_scratch_preserves_piece_order_and_counts() {
+        let model = core(r"[a-z]+| ");
+        let allowed = HashSet::new();
+        let text = "ababa aaaa abba abcabc ab";
+        let expected = vec![
+            256, 256, 97, 32, 258, 258, 32, 256, 98, 97, 32, 257, 257, 32, 256,
+        ];
+        let (actual, last_piece) = model.encode(text, &allowed).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(last_piece, 1);
+        assert_eq!(model.encode_ordinary(text), expected);
+        assert_eq!(model.count_tokens(text, &allowed).unwrap(), expected.len());
+    }
+
+    #[test]
+    fn short_merge_scratch_handles_heap_boundary_and_repeated_lengths() {
+        let model = core(r"[a-z]+| ");
+        let mut text = String::new();
+        let mut expected = Vec::new();
+        for size in [2, 3, 98, 99, 100, 101, 3, 2] {
+            text.push_str(&"a".repeat(size));
+            text.push(' ');
+            expected.extend(std::iter::repeat_n(258, size / 2));
+            if size % 2 != 0 {
+                expected.push(97);
+            }
+            expected.push(32);
+        }
+        assert_eq!(model.encode(&text, &HashSet::new()).unwrap().0, expected);
+        assert_eq!(
+            model.count_tokens(&text, &HashSet::new()).unwrap(),
+            expected.len()
+        );
+    }
+
+    #[test]
+    fn merge_scratch_stays_private_across_concurrent_calls() {
+        let model = std::sync::Arc::new(core(r"[a-z]+| "));
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                let model = model.clone();
+                scope.spawn(move || {
+                    for _ in 0..32 {
+                        let (ids, last_piece) =
+                            model.encode("ababa abba", &HashSet::new()).unwrap();
+                        assert_eq!(ids, [256, 256, 97, 32, 256, 98, 97]);
+                        assert_eq!(last_piece, 3);
+                        assert_eq!(
+                            model.count_tokens("ababa abba", &HashSet::new()).unwrap(),
+                            7
+                        );
+                    }
+                });
+            }
+        });
     }
 
     #[test]

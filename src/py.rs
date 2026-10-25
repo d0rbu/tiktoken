@@ -9,7 +9,73 @@ use pyo3::{
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::rmcp_source::{Batch as SourceBatch, Cursor as SourceCursor, ReadError};
+use crate::rmcp_token_storage;
 use crate::{CoreBPE, Rank, byte_pair_encode};
+
+fn storage_width(width: u8) -> PyResult<u8> {
+    match width {
+        8..=32 => Ok(width),
+        _ => Err(exceptions::PyValueError::new_err(
+            "token storage width must be between 8 and 32",
+        )),
+    }
+}
+
+#[pyclass(name = "_TokenStorageEncoder")]
+struct TokenStorageEncoder {
+    encoder: rmcp_token_storage::Encoder,
+}
+
+#[pymethods]
+impl TokenStorageEncoder {
+    #[new]
+    fn new(width: u8) -> PyResult<Self> {
+        Ok(Self {
+            encoder: rmcp_token_storage::Encoder::new(storage_width(width)?),
+        })
+    }
+
+    fn push(&mut self, py: Python<'_>, raw: &Bound<'_, PyBytes>) -> Py<PyBytes> {
+        let raw = raw.as_bytes();
+        let bytes = py.detach(|| self.encoder.push(raw));
+        PyBytes::new(py, bytes).unbind()
+    }
+
+    fn finish(&mut self, py: Python<'_>) -> Py<PyBytes> {
+        PyBytes::new(py, self.encoder.finish()).unbind()
+    }
+}
+
+#[pyclass(name = "_TokenStorageDecoder", frozen)]
+struct TokenStorageDecoder {
+    width: u8,
+}
+
+#[pymethods]
+impl TokenStorageDecoder {
+    #[new]
+    fn new(width: u8) -> PyResult<Self> {
+        Ok(Self {
+            width: storage_width(width)?,
+        })
+    }
+
+    fn read(
+        &self,
+        py: Python<'_>,
+        data: &Bound<'_, PyBytes>,
+        bit_offset: usize,
+        count: usize,
+    ) -> PyResult<Py<PyAny>> {
+        let data = data.as_bytes();
+        let ids = py
+            .detach(|| rmcp_token_storage::decode(data, self.width, bit_offset, count))
+            .ok_or_else(|| {
+                exceptions::PyValueError::new_err("packed token range exceeds stored bytes")
+            })?;
+        TiktokenBuffer::new(ids).into_py_any(py)
+    }
+}
 
 fn source_io_error(py: Python<'_>, error: std::io::Error, path: &str) -> PyErr {
     if let Some(errno) = error.raw_os_error() {
@@ -402,5 +468,7 @@ impl TiktokenBuffer {
 #[pymodule(gil_used = false)]
 fn _tiktoken(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<CoreBPE>()?;
+    m.add_class::<TokenStorageEncoder>()?;
+    m.add_class::<TokenStorageDecoder>()?;
     Ok(())
 }
