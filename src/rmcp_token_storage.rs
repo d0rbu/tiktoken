@@ -52,6 +52,47 @@ impl Encoder {
         }
     }
 
+    /// Append an already packed range without expanding its complete ID array.
+    pub(crate) fn push_packed(
+        &mut self,
+        data: &[u8],
+        position: usize,
+        count: usize,
+    ) -> Option<&[u8]> {
+        let width = usize::from(self.width);
+        let bits = count.checked_mul(width)?;
+        if position.checked_add(bits)? > data.len().checked_mul(8)? {
+            return None;
+        }
+        self.output.clear();
+        self.output.reserve(bits / 8 + self.length * width / 8 + 32);
+        let mut at = position;
+        let mut remaining = count;
+        if self.length != 0 {
+            while self.length < 8 && remaining != 0 {
+                self.pending[self.length] = one(data, at, self.width);
+                self.length += 1;
+                at += width;
+                remaining -= 1;
+            }
+            if self.length < 8 {
+                return Some(&self.output);
+            }
+            block(self.width, &self.pending, &mut self.output);
+            self.length = 0;
+        }
+        let bytes = remaining / 8 * width;
+        copy_packed_bytes(data, at, bytes, &mut self.output);
+        at += bytes * 8;
+        remaining %= 8;
+        for i in 0..remaining {
+            self.pending[i] = one(data, at, self.width);
+            at += width;
+        }
+        self.length = remaining;
+        Some(&self.output)
+    }
+
     /// Emit only a successful end's remaining IDs and zero high padding bits.
     pub(crate) fn finish(&mut self) -> &[u8] {
         self.output.clear();
@@ -71,6 +112,27 @@ impl Encoder {
         }
         self.length = 0;
         &self.output
+    }
+}
+
+/// The admitted range contains complete groups of eight IDs (whole bytes).
+fn copy_packed_bytes(data: &[u8], position: usize, count: usize, output: &mut Vec<u8>) {
+    let begin = position / 8;
+    let shift = position % 8;
+    if shift == 0 {
+        output.extend_from_slice(&data[begin..begin + count]);
+        return;
+    }
+    let words = count / 8 * 8;
+    for offset in (0..words).step_by(8) {
+        let at = begin + offset;
+        let low = u64::from_le_bytes(data[at..at + 8].try_into().unwrap());
+        let next = u64::from(data[at + 8]);
+        output.extend_from_slice(&((low >> shift) | (next << (64 - shift))).to_le_bytes());
+    }
+    for offset in words..count {
+        let at = begin + offset;
+        output.push((data[at] >> shift) | (data[at + 1] << (8 - shift)));
     }
 }
 
@@ -167,6 +229,117 @@ mod tests {
             }
         }
         bytes
+    }
+
+    fn shifted(ids: &[u32], width: u8, offset: usize) -> Vec<u8> {
+        let mut bytes = vec![0xa5; (offset + ids.len() * usize::from(width)).div_ceil(8) + 2];
+        for (i, &id) in ids.iter().enumerate() {
+            for bit in 0..usize::from(width) {
+                let at = offset + i * usize::from(width) + bit;
+                bytes[at / 8] &= !(1 << (at % 8));
+                bytes[at / 8] |= (((id >> bit) & 1) as u8) << (at % 8);
+            }
+        }
+        bytes
+    }
+
+    #[test]
+    fn mixed_raw_packed_edges_all_widths_offsets_and_pending_lengths_match_bits() {
+        for width in 8..=32 {
+            let mask = ((1u64 << width) - 1) as u32;
+            let all: Vec<u32> = (0u32..280)
+                .map(|i| match i % 3 {
+                    0 => 0,
+                    1 => mask,
+                    _ => i.wrapping_mul(0x9e3779b9) & mask,
+                })
+                .collect();
+            for prefix in 0..8 {
+                for count in [0, 1, 2, 7, 8, 9, 15, 16, 17, 63, 257] {
+                    for offset in 0..8 {
+                        let mut encoder = Encoder::new(width);
+                        let mut actual = Vec::new();
+                        let left: Vec<u8> =
+                            all[..prefix].iter().flat_map(|x| x.to_le_bytes()).collect();
+                        actual.extend_from_slice(encoder.push(&left));
+                        let packed = shifted(&all[prefix..prefix + count], width, offset);
+                        actual.extend_from_slice(
+                            encoder.push_packed(&packed, offset, count).unwrap(),
+                        );
+                        let tail = &all[prefix + count..prefix + count + 9];
+                        let raw: Vec<u8> = tail.iter().flat_map(|x| x.to_le_bytes()).collect();
+                        actual.extend_from_slice(encoder.push(&raw));
+                        actual.extend_from_slice(encoder.finish());
+                        assert_eq!(actual, oracle(&all[..prefix + count + 9], width));
+                        assert!(encoder.finish().is_empty());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn successive_packed_ranges_keep_arbitrary_frame_and_logical_shard_boundaries() {
+        for width in 8..=32 {
+            let mask = ((1u64 << width) - 1) as u32;
+            let ids: Vec<u32> = (0u32..257)
+                .map(|i| i.wrapping_mul(0x71ad4be5) & mask)
+                .collect();
+            for offset in 0..8 {
+                let data = shifted(&ids, width, offset);
+                for step in [1, 7, 8, 9, 33, 64] {
+                    let mut encoder = Encoder::new(width);
+                    let mut actual = Vec::new();
+                    for first in (0..ids.len()).step_by(step) {
+                        let count = step.min(ids.len() - first);
+                        actual.extend_from_slice(
+                            encoder
+                                .push_packed(&data, offset + first * usize::from(width), count)
+                                .unwrap(),
+                        );
+                    }
+                    actual.extend_from_slice(encoder.finish());
+                    assert_eq!(actual, oracle(&ids, width));
+                }
+                for cut in [1, 7, 8, 9, 31, 128, 256] {
+                    let mut encoder = Encoder::new(width);
+                    let mut left = encoder.push_packed(&data, offset, cut).unwrap().to_vec();
+                    left.extend_from_slice(encoder.finish());
+                    let mut right = encoder
+                        .push_packed(&data, offset + cut * usize::from(width), ids.len() - cut)
+                        .unwrap()
+                        .to_vec();
+                    right.extend_from_slice(encoder.finish());
+                    assert_eq!(left, oracle(&ids[..cut], width));
+                    assert_eq!(right, oracle(&ids[cut..], width));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_packed_ranges_leave_pending_state_unchanged() {
+        for (data, position, count) in [
+            (&[][..], 0, 1),
+            (&[0][..], 0, 1),
+            (&[0; 17][..], 1, 8),
+            (&[0; 17][..], 0, 9),
+            (&[0; 17][..], usize::MAX, 1),
+            (&[0; 17][..], 0, usize::MAX),
+            (&[0][..], 9, 0),
+        ] {
+            let mut encoder = Encoder::new(17);
+            let ids: Vec<u32> = (0..20).map(|i| i * 3001).collect();
+            let prefix: Vec<u8> = ids[..13].iter().flat_map(|x| x.to_le_bytes()).collect();
+            let mut actual = encoder.push(&prefix).to_vec();
+            assert!(encoder.push_packed(data, position, count).is_none());
+            assert_eq!(encoder.output, actual);
+            assert_eq!(encoder.length, 5);
+            let suffix: Vec<u8> = ids[13..].iter().flat_map(|x| x.to_le_bytes()).collect();
+            actual.extend_from_slice(encoder.push(&suffix));
+            actual.extend_from_slice(encoder.finish());
+            assert_eq!(actual, oracle(&ids, 17));
+        }
     }
 
     #[test]

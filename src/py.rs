@@ -41,6 +41,22 @@ impl TokenStorageEncoder {
         PyBytes::new(py, bytes).unbind()
     }
 
+    fn push_packed(
+        &mut self,
+        py: Python<'_>,
+        data: &Bound<'_, PyBytes>,
+        bit_offset: usize,
+        count: usize,
+    ) -> PyResult<Py<PyBytes>> {
+        let data = data.as_bytes();
+        let bytes = py
+            .detach(|| self.encoder.push_packed(data, bit_offset, count))
+            .ok_or_else(|| {
+                exceptions::PyValueError::new_err("packed token range exceeds stored bytes")
+            })?;
+        Ok(PyBytes::new(py, bytes).unbind())
+    }
+
     fn finish(&mut self, py: Python<'_>) -> Py<PyBytes> {
         PyBytes::new(py, self.encoder.finish()).unbind()
     }

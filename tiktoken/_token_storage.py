@@ -15,6 +15,9 @@ class TokenStorageEncoder:
     def push(self, raw: bytes) -> bytes:
         return self._encoder.push(raw)
 
+    def push_packed(self, data: bytes, bit_offset: int, count: int) -> bytes:
+        return self._encoder.push_packed(data, bit_offset, count)
+
     def finish(self) -> bytes:
         return self._encoder.finish()
 

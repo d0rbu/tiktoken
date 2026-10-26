@@ -1,6 +1,7 @@
 """Independent storage bytes and retained-buffer contracts, without tokenizer I/O."""
 
 import gc
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from itertools import cycle
 
@@ -121,3 +122,77 @@ def test_immutable_decoder_has_no_shared_mutable_results() -> None:
     assert [v.tolist() for v in views] == [
         ids[start : start + 128] for start in range(64)
     ]
+
+
+@given(
+    width=st.integers(8, 32),
+    values=st.lists(st.integers(0, 2**32 - 1), max_size=129),
+    step=st.integers(1, 33),
+    offset=st.integers(0, 7),
+)
+def test_mixed_raw_and_packed_ranges_preserve_complete_bytes(
+    width: int, values: list[int], step: int, offset: int
+) -> None:
+    ids = [value & ((1 << width) - 1) for value in values]
+    packed = oracle(ids, width)
+    bits = (int.from_bytes(packed, "little") << offset) | ((1 << offset) - 1)
+    shifted = bits.to_bytes((offset + len(ids) * width + 7) // 8, "little") + b"\xff"
+    encoder = TokenStorageEncoder(width)
+    pieces = []
+    for index, start in enumerate(range(0, len(ids), step)):
+        count = min(step, len(ids) - start)
+        if index % 2:
+            pieces.append(encoder.push_packed(shifted, offset + start * width, count))
+        else:
+            raw = b"".join(
+                token.to_bytes(4, "little") for token in ids[start : start + count]
+            )
+            pieces.append(encoder.push(raw))
+    pieces.append(encoder.push_packed(shifted, offset + len(ids) * width, 0))
+    pieces.append(encoder.finish())
+    assert all(type(piece) is bytes for piece in pieces)
+    assert b"".join(pieces) == packed
+    assert encoder.finish() == b""
+
+
+@pytest.mark.parametrize(
+    ("data", "offset", "count"),
+    [
+        (b"", 0, 1),
+        (b"\x00", 0, 1),
+        (b"\x00" * 17, 1, 8),
+        (b"\x00" * 17, 0, 9),
+        (b"", sys.maxsize * 2 + 1, 1),
+        (b"", 0, sys.maxsize * 2 + 1),
+        (b"\x00", 9, 0),
+    ],
+)
+def test_rejected_packed_range_retains_pending_ids_and_earlier_output(
+    data: bytes, offset: int, count: int
+) -> None:
+    ids = [index * 3001 for index in range(20)]
+    raw = b"".join(token.to_bytes(4, "little") for token in ids)
+    encoder = TokenStorageEncoder(17)
+    before = encoder.push(raw[: 13 * 4])
+    with pytest.raises(ValueError, match="packed token range exceeds stored bytes"):
+        encoder.push_packed(data, offset, count)
+    after = encoder.push(raw[13 * 4 :]) + encoder.finish()
+    assert before + after == oracle(ids, 17)
+
+
+@pytest.mark.parametrize(("offset", "count"), [(-1, 0), (0, -1)])
+def test_negative_packed_range_arguments_are_rejected(offset: int, count: int) -> None:
+    with pytest.raises(OverflowError):
+        TokenStorageEncoder(17).push_packed(b"", offset, count)
+
+
+def test_packed_append_outputs_keep_their_own_bytes() -> None:
+    ids = [index * 131 for index in range(25)]
+    packed = oracle(ids, 17)
+    encoder = TokenStorageEncoder(17)
+    first = encoder.push_packed(packed, 0, 13)
+    later = encoder.push_packed(packed, 13 * 17, 12) + encoder.finish()
+    del encoder
+    gc.collect()
+    assert first == oracle(ids[:8], 17)
+    assert first + later == packed
