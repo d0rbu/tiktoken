@@ -8,10 +8,184 @@ use pyo3::{
 };
 use rustc_hash::FxHashMap as HashMap;
 
+use crate::rmcp_source::{Batch as SourceBatch, Cursor as SourceCursor, ReadError};
+use crate::rmcp_token_storage;
 use crate::{CoreBPE, Rank, byte_pair_encode};
+
+fn storage_width(width: u8) -> PyResult<u8> {
+    match width {
+        8..=32 => Ok(width),
+        _ => Err(exceptions::PyValueError::new_err(
+            "token storage width must be between 8 and 32",
+        )),
+    }
+}
+
+#[pyclass(name = "_TokenStorageEncoder")]
+struct TokenStorageEncoder {
+    encoder: rmcp_token_storage::Encoder,
+}
+
+#[pymethods]
+impl TokenStorageEncoder {
+    #[new]
+    fn new(width: u8) -> PyResult<Self> {
+        Ok(Self {
+            encoder: rmcp_token_storage::Encoder::new(storage_width(width)?),
+        })
+    }
+
+    fn push(&mut self, py: Python<'_>, raw: &Bound<'_, PyBytes>) -> Py<PyBytes> {
+        let raw = raw.as_bytes();
+        let bytes = py.detach(|| self.encoder.push(raw));
+        PyBytes::new(py, bytes).unbind()
+    }
+
+    fn finish(&mut self, py: Python<'_>) -> Py<PyBytes> {
+        PyBytes::new(py, self.encoder.finish()).unbind()
+    }
+}
+
+#[pyclass(name = "_TokenStorageDecoder", frozen)]
+struct TokenStorageDecoder {
+    width: u8,
+}
+
+#[pymethods]
+impl TokenStorageDecoder {
+    #[new]
+    fn new(width: u8) -> PyResult<Self> {
+        Ok(Self {
+            width: storage_width(width)?,
+        })
+    }
+
+    fn read(
+        &self,
+        py: Python<'_>,
+        data: &Bound<'_, PyBytes>,
+        bit_offset: usize,
+        count: usize,
+    ) -> PyResult<Py<PyAny>> {
+        let data = data.as_bytes();
+        let ids = py
+            .detach(|| rmcp_token_storage::decode(data, self.width, bit_offset, count))
+            .ok_or_else(|| {
+                exceptions::PyValueError::new_err("packed token range exceeds stored bytes")
+            })?;
+        TiktokenBuffer::new(ids).into_py_any(py)
+    }
+}
+
+fn source_io_error(py: Python<'_>, error: std::io::Error, path: &str) -> PyErr {
+    if let Some(errno) = error.raw_os_error() {
+        let message = py
+            .import("os")
+            .and_then(|os| os.call_method1("strerror", (errno,)))
+            .and_then(|value| value.extract::<String>());
+        match message {
+            Ok(message) => exceptions::PyOSError::new_err((errno, message, path.to_owned())),
+            Err(error) => error,
+        }
+    } else {
+        exceptions::PyOSError::new_err(error.to_string())
+    }
+}
+
+#[pyclass]
+struct OwnedSourceCursor {
+    cursor: SourceCursor,
+    path: String,
+}
+
+#[pyclass(frozen)]
+struct OwnedSourceBatch {
+    batch: SourceBatch,
+}
+
+#[pymethods]
+impl OwnedSourceCursor {
+    fn close(&mut self) {
+        self.cursor.close();
+    }
+
+    fn read_batch(
+        &mut self,
+        py: Python<'_>,
+        provenance: bool,
+    ) -> PyResult<Option<OwnedSourceBatch>> {
+        match py.detach(|| self.cursor.batch(provenance)) {
+            Ok(batch) => Ok(batch.map(|batch| OwnedSourceBatch { batch })),
+            Err(ReadError::Io(error)) => Err(source_io_error(py, error, &self.path)),
+            Err(ReadError::Declined) => Err(exceptions::PyNotImplementedError::new_err(
+                "source batch requires the original Python decoder before encoding",
+            )),
+        }
+    }
+
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyBytes>>> {
+        match py.detach(|| self.cursor.raw_line()) {
+            Ok(line) => Ok(line.map(|line| PyBytes::new(py, &line).unbind())),
+            Err(error) => Err(source_io_error(py, error, &self.path)),
+        }
+    }
+}
+
+#[pymethods]
+impl OwnedSourceBatch {
+    #[getter]
+    fn provenance(&self) -> Vec<Option<String>> {
+        self.batch.provenance.clone()
+    }
+}
 
 #[pymethods]
 impl CoreBPE {
+    #[pyo3(signature = (path, split, start, stop=None))]
+    fn _open_source(
+        &self,
+        py: Python<'_>,
+        path: String,
+        split: String,
+        start: u64,
+        stop: Option<u64>,
+    ) -> PyResult<OwnedSourceCursor> {
+        let opened =
+            py.detach(|| SourceCursor::open(std::path::Path::new(&path), split, start, stop));
+        match opened {
+            Ok(cursor) => Ok(OwnedSourceCursor { cursor, path }),
+            Err(error) => Err(source_io_error(py, error, &path)),
+        }
+    }
+
+    fn _encode_source_batch(
+        &self,
+        py: Python<'_>,
+        batch: &OwnedSourceBatch,
+        allowed_special: HashSet<PyBackedStr>,
+        eos: Rank,
+    ) -> PyResult<(Py<PyAny>, Vec<usize>)> {
+        let result = py.detach(|| {
+            let allowed: HashSet<&str> = allowed_special.iter().map(|s| s.as_ref()).collect();
+            let rows =
+                self.encode_batch_serial(batch.batch.texts.iter().map(String::as_str), &allowed)?;
+            let lengths: Vec<usize> = rows.iter().map(|row| row.len() + 1).collect();
+            let mut ids = Vec::with_capacity(lengths.iter().sum());
+            for row in rows {
+                ids.extend(row);
+                ids.push(eos);
+            }
+            Ok::<_, crate::EncodeError>((ids, lengths))
+        });
+        let (ids, lengths) =
+            result.map_err(|error| exceptions::PyValueError::new_err(error.message))?;
+        Ok((TiktokenBuffer::new(ids).into_py_any(py)?, lengths))
+    }
+
     #[new]
     fn py_new(
         encoder: HashMap<Vec<u8>, Rank>,
@@ -321,5 +495,7 @@ impl TiktokenBuffer {
 #[pymodule(gil_used = false)]
 fn _tiktoken(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<CoreBPE>()?;
+    m.add_class::<TokenStorageEncoder>()?;
+    m.add_class::<TokenStorageDecoder>()?;
     Ok(())
 }

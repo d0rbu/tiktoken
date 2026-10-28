@@ -11,6 +11,7 @@ crate-type = ["cdylib", "rlib"]
 default = []
 python = [
     "pyo3",
+    "serde_json",
 ]
 
 [dependencies]
@@ -26,3 +27,7 @@ regex = "1.13.1"
 regex-automata = { version = "=0.4.18", default-features = false, features = ["meta"] }
 rustc-hash = "2"
 bstr = "1.13.1"
+serde_json = { version = "1.0", features = ["raw_value"], optional = true }
+
+[dev-dependencies]
+serde_json = { version = "1.0", features = ["raw_value"] }
