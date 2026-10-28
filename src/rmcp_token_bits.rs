@@ -55,13 +55,45 @@ pub fn _unpack_bits17_into(
             "packed source and decoded destination must not overlap",
         ));
     }
-    for (index, target) in output.iter().enumerate() {
-        let bit = start_bit + index * 17;
+    let one = |bit: usize| {
         let byte = bit / 8;
         let word = input[byte].get() as u32
             | (input[byte + 1].get() as u32) << 8
             | (input[byte + 2].get() as u32) << 16;
-        target.set(((word >> (bit % 8)) & 0x1ffff) as i64);
+        ((word >> (bit % 8)) & 0x1ffff) as i64
+    };
+    let mut bit = start_bit;
+    let mut used = 0;
+    while used < output.len() && bit % 8 != 0 {
+        output[used].set(one(bit));
+        used += 1;
+        bit += 17;
+    }
+    while output.len() - used >= 8 {
+        let byte = bit / 8;
+        let a = u64::from_le_bytes(std::array::from_fn(|i| input[byte + i].get()));
+        let b = u64::from_le_bytes(std::array::from_fn(|i| input[byte + 8 + i].get()));
+        let mask = 0x1ffff;
+        let values = [
+            a & mask,
+            (a >> 17) & mask,
+            (a >> 34) & mask,
+            ((a >> 51) | (b << 13)) & mask,
+            (b >> 4) & mask,
+            (b >> 21) & mask,
+            (b >> 38) & mask,
+            (b >> 55) | (u64::from(input[byte + 16].get()) << 9),
+        ];
+        for (target, value) in output[used..used + 8].iter().zip(values) {
+            target.set(value as i64);
+        }
+        used += 8;
+        bit += 136;
+    }
+    while used < output.len() {
+        output[used].set(one(bit));
+        used += 1;
+        bit += 17;
     }
     Ok(())
 }
