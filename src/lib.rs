@@ -12,6 +12,8 @@ mod py;
 mod rmcp_regex;
 #[cfg(any(feature = "python", test))]
 mod rmcp_source;
+#[cfg(feature = "python")]
+mod rmcp_token_bits;
 #[cfg(any(feature = "python", test))]
 mod rmcp_token_storage;
 

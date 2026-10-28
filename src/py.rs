@@ -497,5 +497,6 @@ fn _tiktoken(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<CoreBPE>()?;
     m.add_class::<TokenStorageEncoder>()?;
     m.add_class::<TokenStorageDecoder>()?;
+    m.add_function(wrap_pyfunction!(crate::rmcp_token_bits::_unpack_bits17_into, m)?)?;
     Ok(())
 }
