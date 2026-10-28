@@ -5,7 +5,13 @@ Only a successful source/shard end calls finish. Decoder views own their buffers
 neither conversion shares mutable output with a later call.
 """
 
+from collections.abc import Callable
+
 from tiktoken import _tiktoken
+
+unpack_bits17_into: Callable[[object, int, object], None] = (
+    _tiktoken._unpack_bits17_into
+)
 
 
 class TokenStorageEncoder:

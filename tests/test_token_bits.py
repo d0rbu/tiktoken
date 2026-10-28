@@ -11,6 +11,14 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from tiktoken import _tiktoken
+from tiktoken._token_storage import unpack_bits17_into
+
+
+def test_python_storage_alias_retains_the_native_callable() -> None:
+    assert unpack_bits17_into is _tiktoken._unpack_bits17_into
+    output = np.empty(1, dtype=np.int64)
+    unpack_bits17_into(bytes([1, 0, 0]), 0, output)
+    assert output.tolist() == [1]
 
 
 def literal(ids: list[int], leading_bits: int = 0) -> bytes:
