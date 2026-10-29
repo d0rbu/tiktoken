@@ -2,6 +2,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 use std::path::Path;
 
 use serde_json::value::RawValue;
@@ -34,7 +36,17 @@ pub(crate) struct Cursor {
 
 impl Cursor {
     pub fn open(path: &Path, split: String, start: u64, stop: Option<u64>) -> io::Result<Self> {
-        let mut input = BufReader::new(File::open(path)?);
+        let file = File::open(path)?;
+        #[cfg(target_os = "linux")]
+        {
+            // Each range consumes whole records in increasing byte order. This
+            // optional policy hint never replaces an actual open/read error.
+            // SAFETY: file owns this live descriptor; advice changes no bytes.
+            unsafe {
+                libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
+            }
+        }
+        let mut input = BufReader::new(file);
         let mut position = start;
         if start > 0 {
             input.seek(SeekFrom::Start(start - 1))?;

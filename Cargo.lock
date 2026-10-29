@@ -270,6 +270,7 @@ version = "0.14.0"
 dependencies = [
  "bstr",
  "fancy-regex",
+ "libc",
  "pyo3",
  "regex",
  "regex-automata",
