@@ -9,6 +9,8 @@ use rustc_hash::FxHashMap as HashMap;
 
 #[cfg(feature = "python")]
 mod py;
+#[cfg(any(feature = "python", test))]
+mod rmcp_ranges;
 mod rmcp_regex;
 
 pub type Rank = u32;
