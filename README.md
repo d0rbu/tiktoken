@@ -129,3 +129,15 @@ setup(
 Then simply `pip install ./my_tiktoken_extension` and you should be able to use your
 custom encodings! Make sure **not** to use an editable install.
 
+
+## RMCP count-only pair ranks
+
+The count-only short-piece traversal indexes initial adjacent-byte ranks in an
+immutable 65,536-entry table derived from the encoder. It retains the original
+merge order and later span lookups, with ordinary encoding, long pieces, regex
+matching and special-token policy unchanged. Each CoreBPE instance owns an extra
+256 KiB; cloning the model also clones that table.
+
+The Rust tests compare every two-byte key, including missing and maximum ranks,
+and compare complete short-piece merge boundaries with the original traversal.
+Unicode, special-token, repeated-call and long-piece controls remain covered.

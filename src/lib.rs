@@ -139,6 +139,15 @@ fn _byte_pair_merge_large(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<R
 }
 
 fn _byte_pair_merge(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<(usize, Rank)> {
+    _byte_pair_merge_with_initial_ranks::<false>(ranks, piece, &[])
+}
+
+#[inline(always)]
+fn _byte_pair_merge_with_initial_ranks<const TABLE: bool>(
+    ranks: &HashMap<Vec<u8>, Rank>,
+    piece: &[u8],
+    two_byte_ranks: &[Rank],
+) -> Vec<(usize, Rank)> {
     // This is a vector of (start, rank).
     // The rank is of the pair starting at position start.
     let mut parts = Vec::with_capacity(piece.len() + 1);
@@ -148,7 +157,11 @@ fn _byte_pair_merge(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<(usize,
     // merge priority from token index or to prevent specific token merges.
     let mut min_rank: (Rank, usize) = (Rank::MAX, usize::MAX);
     for i in 0..piece.len() - 1 {
-        let rank = *ranks.get(&piece[i..i + 2]).unwrap_or(&Rank::MAX);
+        let rank = if TABLE {
+            two_byte_ranks[usize::from(u16::from_be_bytes([piece[i], piece[i + 1]]))]
+        } else {
+            *ranks.get(&piece[i..i + 2]).unwrap_or(&Rank::MAX)
+        };
         if rank < min_rank.0 {
             min_rank = (rank, i);
         }
@@ -320,6 +333,8 @@ const MAX_NUM_THREADS: usize = 128;
 #[derive(Clone)]
 pub struct CoreBPE {
     encoder: HashMap<Vec<u8>, Rank>,
+    // Immutable direct index for count-only initial two-byte rank lookups.
+    two_byte_ranks: Box<[Rank]>,
     special_tokens_encoder: HashMap<String, Rank>,
     decoder: HashMap<Rank, Vec<u8>>,
     special_tokens_decoder: HashMap<Rank, Vec<u8>>,
@@ -461,7 +476,9 @@ impl CoreBPE {
                 }
                 if COUNT_ONLY && piece.len() > 1 && piece.len() < 100 {
                     // Complete byte vocabularies need only the same merge boundaries.
-                    last_piece_token_len = _byte_pair_merge(&self.encoder, piece).len() - 1;
+                    last_piece_token_len = _byte_pair_merge_with_initial_ranks::<true>(
+                        &self.encoder, piece, &self.two_byte_ranks,
+                    ).len() - 1;
                     count += last_piece_token_len;
                 } else {
                     let tokens = byte_pair_encode(piece, &self.encoder);
@@ -719,8 +736,16 @@ impl CoreBPE {
         let mut sorted_token_bytes: Vec<Vec<u8>> = encoder.keys().cloned().collect();
         sorted_token_bytes.sort();
 
+        let mut two_byte_ranks = vec![Rank::MAX; 1 << 16].into_boxed_slice();
+        for (piece, &rank) in &encoder {
+            if let [left, right] = piece.as_slice() {
+                two_byte_ranks[usize::from(u16::from_be_bytes([*left, *right]))] = rank;
+            }
+        }
+
         Ok(Self {
             encoder,
+            two_byte_ranks,
             special_tokens_encoder,
             decoder,
             special_tokens_decoder,
@@ -802,6 +827,72 @@ mod owned_batch_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn two_byte_table_preserves_every_pair_including_missing_and_max_rank() {
+        let mut ranks: HashMap<Vec<u8>, Rank> = (0_u16..256)
+            .map(|byte| (vec![byte as u8], byte as Rank)).collect();
+        for pair in (0_u32..65536).step_by(17) {
+            ranks.insert((pair as u16).to_be_bytes().to_vec(), pair + 256);
+        }
+        ranks.insert(vec![255, 255], Rank::MAX);
+        let model = CoreBPE::new_internal(ranks, HashMap::default(), r"(?s).+").unwrap();
+        for pair in 0_u32..65536 {
+            let piece = (pair as u16).to_be_bytes();
+            let expected = *model.encoder.get(piece.as_slice()).unwrap_or(&Rank::MAX);
+            assert_eq!(model.two_byte_ranks[pair as usize], expected);
+            assert_eq!(crate::_byte_pair_merge_with_initial_ranks::<true>(
+                &model.encoder, &piece, &model.two_byte_ranks),
+                crate::_byte_pair_merge(&model.encoder, &piece));
+        }
+    }
+
+    #[test]
+    fn two_byte_table_keeps_original_short_merge_boundaries_and_full_counts() {
+        let model = core(include_str!("rmcp_pattern.txt"));
+        for code in 0_u32..65536 {
+            let mut value = code;
+            let mut text = String::new();
+            for _ in 0..8 {
+                text.push(['a', 'b', ' ', '!'][(value & 3) as usize]);
+                value >>= 2;
+            }
+            assert_eq!(crate::_byte_pair_merge_with_initial_ranks::<true>(
+                &model.encoder, text.as_bytes(), &model.two_byte_ranks),
+                crate::_byte_pair_merge(&model.encoder, text.as_bytes()));
+            let allowed = HashSet::new();
+            let ids = model.encode(&text, &allowed).unwrap().0;
+            assert_eq!(model.count_tokens(&text, &allowed).unwrap(), ids.len());
+            assert_eq!(model.decode_bytes(&ids).unwrap(), text.as_bytes());
+        }
+        for length in 2..100 {
+            let piece: Vec<u8> = (0..length).map(|i| ((i * 67 + length * 13) & 255) as u8).collect();
+            assert_eq!(crate::_byte_pair_merge_with_initial_ranks::<true>(
+                &model.encoder, &piece, &model.two_byte_ranks),
+                crate::_byte_pair_merge(&model.encoder, &piece));
+        }
+        for text in [String::new(), "ab ! ".repeat(99), "é😀 abc ! 123\n".repeat(37),
+                     "a".repeat(99), "a".repeat(100), "a".repeat(101),
+                     "!".repeat(1024), "<S>ab!<T> ".repeat(23)] {
+            for allowed in [HashSet::new(), HashSet::from(["<S>", "<T>"])] {
+                let ids = model.encode(&text, &allowed).unwrap().0;
+                for _ in 0..3 {
+                    assert_eq!(model.count_tokens(&text, &allowed).unwrap(), ids.len());
+                }
+                assert_eq!(model.decode_bytes(&ids).unwrap(), text.as_bytes());
+            }
+        }
+    }
+
+    #[test]
+    fn two_byte_table_is_an_owned_immutable_encoder_index_cloned_with_model() {
+        let model = core(include_str!("rmcp_pattern.txt"));
+        let cloned = model.clone();
+        assert_eq!(model.two_byte_ranks.len(), 65536);
+        assert_eq!(std::mem::size_of_val(model.two_byte_ranks.as_ref()), 262144);
+        assert_eq!(model.two_byte_ranks, cloned.two_byte_ranks);
+        assert_ne!(model.two_byte_ranks.as_ptr(), cloned.two_byte_ranks.as_ptr());
     }
 
     #[test]
