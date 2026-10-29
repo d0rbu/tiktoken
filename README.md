@@ -129,3 +129,19 @@ setup(
 Then simply `pip install ./my_tiktoken_extension` and you should be able to use your
 custom encodings! Make sure **not** to use an editable install.
 
+
+
+## RMCP range counts
+
+The fork's `CoreBPE.count_tokens_ranges` can build a temporary piece index for
+overlapping ranges under the exact pattern in `src/rmcp_pattern.txt`. It reuses
+counts between shared piece boundaries and retokenizes the range edges. The index
+lives for one call. It requires a complete byte vocabulary, a nonempty registry
+without empty special literals, every registered special enabled, text of at most
+64 KiB, and requested ranges totaling at least twice the full text length.
+Other calls use the existing scalar loop, including its original input errors.
+
+Rust and Python regressions compare full-ID counts across Unicode boundaries,
+partial special policies, overlapping literals, incomplete vocabularies, invalid
+ranges, and empty registries. The RMCP consumer additionally qualifies the native
+binary against Hugging Face counts and exact public-selector artifacts.

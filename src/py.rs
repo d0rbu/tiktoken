@@ -75,6 +75,9 @@ impl CoreBPE {
         py.detach(|| {
             let allowed_special: HashSet<&str> =
                 allowed_special.iter().map(|s| s.as_ref()).collect();
+            if let Some(counts) = self.try_count_ranges_indexed(text, &ranges, &allowed_special) {
+                return Ok(counts);
+            }
             ranges
                 .into_iter()
                 .map(|(start, end)| {
