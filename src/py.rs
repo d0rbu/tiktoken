@@ -267,6 +267,43 @@ impl CoreBPE {
         })
     }
 
+    /// Return full IDs plus scalar-equivalent counts for UTF-8 byte prefixes.
+    fn encode_with_prefix_counts(
+        &self,
+        py: Python,
+        text: &str,
+        prefix_ends: Vec<usize>,
+        allowed_special: HashSet<PyBackedStr>,
+    ) -> PyResult<(Py<PyAny>, Vec<usize>)> {
+        let result: PyResult<(Vec<Rank>, Vec<usize>)> = py.detach(|| {
+            let allowed: HashSet<&str> = allowed_special.iter().map(|s| s.as_ref()).collect();
+            if let Some(result) =
+                self.try_encode_count_prefixes_indexed(text, &prefix_ends, &allowed)
+            {
+                return Ok(result);
+            }
+            // Preserve first-error order: requested counts, then full encoding.
+            let counts = prefix_ends
+                .into_iter()
+                .map(|end| {
+                    let prefix = text.get(..end).ok_or_else(|| {
+                        exceptions::PyValueError::new_err(
+                            "prefix end must be in bounds and on a UTF-8 boundary",
+                        )
+                    })?;
+                    self.count_tokens(prefix, &allowed)
+                        .map_err(|e| exceptions::PyValueError::new_err(e.message))
+                })
+                .collect::<PyResult<Vec<_>>>()?;
+            let (ids, _) = self
+                .encode(text, &allowed)
+                .map_err(|e| exceptions::PyValueError::new_err(e.message))?;
+            Ok((ids, counts))
+        });
+        let (ids, counts) = result?;
+        Ok((TiktokenBuffer::new(ids).into_py_any(py)?, counts))
+    }
+
     fn encode_to_tiktoken_buffer(
         &self,
         py: Python,

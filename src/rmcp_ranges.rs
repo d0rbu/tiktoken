@@ -3,9 +3,77 @@
 
 use std::collections::HashSet;
 
-use crate::{CoreBPE, EncodeError, _byte_pair_merge, byte_pair_encode};
+use crate::{CoreBPE, EncodeError, Rank, _byte_pair_merge, byte_pair_encode};
 
 impl CoreBPE {
+    /// Build endpoint IDs and independent truncated-prefix counts in one call.
+    /// Prefix EOF edges are retokenized, never obtained by slicing full IDs.
+    pub(crate) fn try_encode_count_prefixes_indexed(
+        &self,
+        text: &str,
+        prefix_ends: &[usize],
+        allowed: &HashSet<&str>,
+    ) -> Option<(Vec<Rank>, Vec<usize>)> {
+        if self.regular_regex_tls.is_none()
+            || text.is_empty()
+            || text.len() > 65536
+            || prefix_ends.len() < 2
+            || self.special_tokens_encoder.is_empty()
+            || self.special_tokens_encoder.contains_key("")
+            || !self
+                .special_tokens_encoder
+                .keys()
+                .all(|literal| allowed.contains(literal.as_str()))
+        {
+            return None;
+        }
+        let work = prefix_ends.iter().try_fold(0usize, |sum, &end| {
+            text.get(..end)?;
+            sum.checked_add(end)
+        })?;
+        if work < 2 * text.len() || !(0..=255u8).all(|byte| self.encoder.contains_key(&[byte][..]))
+        {
+            return None;
+        }
+        let mut ids = Vec::new();
+        let mut ends = Vec::new();
+        let mut totals = vec![0usize];
+        self.visit_count_pieces(text, allowed, |end, piece, special| {
+            if special {
+                ids.push(self.special_tokens_encoder[piece]);
+            } else if let Some(&rank) = self.encoder.get(piece.as_bytes()) {
+                ids.push(rank);
+            } else {
+                ids.extend(byte_pair_encode(piece.as_bytes(), &self.encoder));
+            }
+            ends.push(end);
+            totals.push(ids.len());
+            true
+        })
+        .ok()?;
+        if ends.last().copied() != Some(text.len()) {
+            return None;
+        }
+        let counts = prefix_ends
+            .iter()
+            .map(|&end| {
+                if end == text.len() {
+                    return Some(ids.len());
+                }
+                if end == 0 {
+                    return Some(0);
+                }
+                // The exact admitted pattern's EOF lookahead can change the final
+                // piece and its predecessor; reuse only the earlier full pieces.
+                let last = ends.partition_point(|&boundary| boundary < end);
+                let suffix = last.saturating_sub(1);
+                let cut = if suffix == 0 { 0 } else { ends[suffix - 1] };
+                Some(totals[suffix] + self.count_tokens(&text[cut..end], allowed).ok()?)
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some((ids, counts))
+    }
+
     /// Visit the actual ordinary/special partitions, stopping when requested.
     /// A failed speculative visit is discarded in favor of the original API.
     fn visit_count_pieces(
@@ -232,6 +300,20 @@ mod tests {
                 expected.into_iter().rev().collect::<Vec<_>>()
             );
         }
+    }
+
+    #[test]
+    fn combined_prefix_index_emits_exact_full_ids_and_prefix_counts() {
+        let model = core(include_str!("rmcp_pattern.txt"));
+        let allowed = model.special_tokens_encoder.keys().map(String::as_str).collect();
+        for text in ["ababa <S>long<T>abc", "  a\t\r\n  'sfoo'rd!", "界😀é\u{301}\0 1a"] {
+            let mut ends: Vec<_> = text.char_indices().map(|(i, _)| i).collect();
+            ends.extend([text.len(); 3]);
+            let (ids, counts) = model.try_encode_count_prefixes_indexed(text, &ends, &allowed).unwrap();
+            assert_eq!(ids, model.encode(text, &allowed).unwrap().0);
+            assert_eq!(counts, ends.iter().map(|&end| model.encode(&text[..end], &allowed).unwrap().0.len()).collect::<Vec<_>>());
+        }
+        assert!(model.try_encode_count_prefixes_indexed("abc", &[3; 3], &HashSet::new()).is_none());
     }
 
     #[test]

@@ -145,3 +145,16 @@ Rust and Python regressions compare full-ID counts across Unicode boundaries,
 partial special policies, overlapping literals, incomplete vocabularies, invalid
 ranges, and empty registries. The RMCP consumer additionally qualifies the native
 binary against Hugging Face counts and exact public-selector artifacts.
+
+
+## Endpoint encoding with prefix counts
+
+`CoreBPE.encode_with_prefix_counts(text, prefix_ends, allowed_special)` returns
+a full-text token buffer and counts for independently tokenized UTF-8 byte
+prefixes, in request order. Counts are not token-ID slices: truncation can
+change the last BPE pieces. The temporary guarded RMCP piece index reuses
+interiors and retokenizes EOF edges, then is dropped after the call. Other
+patterns, special policies, vocabularies and small calls retain scalar counts
+followed by full encoding. Invalid prefix ends preserve the first requested
+error. This supports causal response endpoints that need both omitted-prefix
+eligibility counts and final IDs.
