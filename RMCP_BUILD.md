@@ -1,4 +1,47 @@
+## Grouped direct storage decode candidate
+
+The direct 17-bit decoder now uses the generic storage decoder's existing
+byte-aligned groups of eight, writing the same existing int64 destination. Scalar
+alignment heads and tails retain the original arithmetic. Buffer exports,
+upfront bounds, byte order, alias rejection and GIL behavior are unchanged; no
+unsafe pointers, extra metadata, audit or new runtime API is introduced.
+
+This targets the R102 thread-CPU profile: native direct decode including buffer
+interop consumed 36.1% of instrumented window CPU and 10.7% of micro CPU. The
+previous actual-consumer R101 candidate failed its frozen performance criteria
+despite exact 135M-ID parity and pooled gains. That failure remains retained;
+this changed native implementation needs its own exact consumer comparison.
+The existing property, every-tail/offset, error, alias and export-lifetime tests
+remain unchanged. No producer, GPU, diverse-corpus or 500B throughput claim.
+
 # RMCP native owned-buffer batch build
+
+## Direct compact consumer (`0.14.0+rmcp.51.dev0`)
+
+This source combines native main `f390545e` with RMCP's existing `c7ea25c1`
+storage/source APIs, then adds the private function
+`_unpack_bits17_into(source, start_bit, destination)`. The function writes 17-bit
+little-endian IDs directly into an existing contiguous native int64 destination.
+It retains the buffer exports and GIL during the call and releases both exports
+on success or failure. It does not encode, change the storage format or retain
+an intermediate token vector. Existing widths and `TokenStorageDecoder.read`
+are unchanged.
+
+Bounds, layout, native byte order and overlapping buffers are checked before
+writing. Unsupported buffer exports raise `BufferError`; incompatible layouts
+and short windows raise `ValueError`. RMCP retains the existing reader for these
+cases and for other storage widths. Readonly input alone does not prove that a
+writable output cannot alias it.
+
+The helper and controls are byte-identical to isolated source `c620c59e`.
+Its mapped-data CPU comparison with the existing generic decoder improved reads
+by 30.1% and CPU micro-batch construction by 10.4%, with all 135,324,160 stored
+IDs, EOS positions and document offsets exact. That repeated token-derived
+fixture is a consumer component result; it does not establish tokenizer,
+complete packing, GPU or 500B-token throughput. An earlier NumPy-cohort timing
+screen failed its variability limit and remains failed. This integrated source
+requires its own build, API/numerical controls and final RMCP qualification before
+adoption.
 
 ## Count-only delivery (`0.14.0+rmcp.6`)
 
