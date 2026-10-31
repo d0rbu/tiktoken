@@ -213,7 +213,7 @@ where
 pub(crate) struct RegularPieces<'r, 't> {
     regex: &'r RegularRegex,
     text: &'t str,
-    input: Input<'t>,
+    start: usize,
     cache: PoolGuard<'r, dfa::Cache, CacheFactory>,
 }
 
@@ -222,7 +222,7 @@ impl<'r, 't> RegularPieces<'r, 't> {
         Self {
             regex,
             text,
-            input: Input::new(text).anchored(Anchored::Yes),
+            start: 0,
             cache: regex.caches.get(),
         }
     }
@@ -232,13 +232,13 @@ impl<'t> Iterator for RegularPieces<'_, 't> {
     type Item = &'t str;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let start = self.input.start();
+        let start = self.start;
         if start == self.text.len() {
             return None;
         }
         if self.regex.ascii_guarded && let Some(length) = ascii_piece_len(&self.text[start..]) {
             let end = start + length;
-            self.input.set_start(end);
+            self.start = end;
             return Some(&self.text[start..end]);
         }
         // No quit bytes, word boundaries, or cache give-up limits are enabled;
@@ -259,7 +259,7 @@ impl<'t> Iterator for RegularPieces<'_, 't> {
                 end = start + final_offset;
             }
         }
-        self.input.set_start(end);
+        self.start = end;
         Some(&self.text[start..end])
     }
 }
@@ -481,12 +481,13 @@ mod tests {
         let mut actual = Vec::new();
         let mut saw_restart = false;
         loop {
-            assert_eq!(pieces.input.get_anchored(), Anchored::Yes);
-            assert!(!pieces.input.get_earliest());
+            let before = pieces.start;
             let Some(piece) = pieces.next() else { break };
-            saw_restart |= piece == " " && text[pieces.input.start()..].starts_with(" ");
+            assert_eq!(pieces.start, before + piece.len());
+            saw_restart |= piece == " " && text[pieces.start..].starts_with(" ");
             actual.push(piece);
         }
+        assert_eq!(pieces.start, text.len());
         assert!(saw_restart);
         assert!(actual.len() > 4);
         assert_eq!(actual.concat(), text);
