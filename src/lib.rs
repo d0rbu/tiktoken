@@ -334,6 +334,7 @@ impl std::fmt::Display for EncodeError {
 impl std::error::Error for EncodeError {}
 
 const MAX_NUM_THREADS: usize = 128;
+const MAX_PIECE_REUSE: usize = 1024;
 
 #[cfg_attr(feature = "python", pyclass(frozen))]
 #[derive(Clone)]
@@ -436,6 +437,8 @@ impl CoreBPE {
         let special_regex = self._get_tl_special_regex();
         let mut ret = vec![];
         let mut parts = Vec::new();
+        // Only this document owns these borrowed keys and output indices.
+        let mut reused: HashMap<&[u8], (usize, usize)> = HashMap::default();
         let mut count = 0;
 
         let mut start = 0;
@@ -479,6 +482,12 @@ impl CoreBPE {
                     }
                     continue;
                 }
+                if !COUNT_ONLY && let Some(&(start, end)) = reused.get(piece) {
+                    last_piece_token_len = end - start;
+                    ret.extend_from_within(start..end);
+                    continue;
+                }
+                let output_start = ret.len();
                 if piece.len() > 1 && piece.len() < 100 {
                     _byte_pair_merge_into(&self.encoder, piece, &mut parts);
                     last_piece_token_len = parts.len() - 1;
@@ -499,6 +508,9 @@ impl CoreBPE {
                     } else {
                         ret.extend(&tokens);
                     }
+                }
+                if !COUNT_ONLY && reused.len() < MAX_PIECE_REUSE {
+                    reused.insert(piece, (output_start, ret.len()));
                 }
             }
 
@@ -866,6 +878,65 @@ mod owned_batch_tests {
             model.count_tokens(&text, &HashSet::new()).unwrap(),
             expected.len()
         );
+    }
+
+    #[test]
+    fn piece_reuse_preserves_specials_and_ranges_after_output_growth() {
+        let model = core(r"[a-z]+| ");
+        let text = "ababa<S>ababa<T>ababa";
+        let expected = [256, 256, 97, 300, 256, 256, 97, 301, 256, 256, 97];
+        let allowed = HashSet::from(["<S>", "<T>"]);
+        for _ in 0..3 {
+            let (actual, last_piece) = model.encode(text, &allowed).unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(last_piece, 3);
+            assert_eq!(model.count_tokens(text, &allowed).unwrap(), expected.len());
+        }
+    }
+
+    #[test]
+    fn piece_reuse_saturation_matches_uncached_ordinary_encoding() {
+        let model = core(r"[^ ]+| ");
+        let mut words = vec!["ababa".to_owned()];
+        words.extend((0..1100).map(|index| format!("{index:012b}")));
+        words.extend([
+            "ababa".to_owned(),
+            "101010101010".to_owned(),
+            "ababa".to_owned(),
+        ]);
+        let text = words.join(" ");
+        let expected = model.encode_ordinary(&text);
+        let (actual, last_piece) = model.encode(&text, &HashSet::new()).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(last_piece, 3);
+        assert_eq!(
+            model.count_tokens(&text, &HashSet::new()).unwrap(),
+            expected.len()
+        );
+    }
+
+    #[test]
+    fn piece_reuse_remains_private_between_models_and_threads() {
+        let first = core(r"[a-z]+| ");
+        let mut ranks = first.encoder.clone();
+        ranks.insert(b"ab".to_vec(), 700);
+        let second = CoreBPE::new_internal(ranks, HashMap::default(), r"[a-z]+| ").unwrap();
+        let text = "ababa ababa abcabc abcabc";
+        std::thread::scope(|scope| {
+            for model in [first, second] {
+                let model = std::sync::Arc::new(model);
+                let expected = model.encode_ordinary(text);
+                for _ in 0..8 {
+                    let model = model.clone();
+                    let expected = expected.clone();
+                    scope.spawn(move || {
+                        for _ in 0..8 {
+                            assert_eq!(model.encode(text, &HashSet::new()).unwrap().0, expected);
+                        }
+                    });
+                }
+            }
+        });
     }
 
     #[test]
