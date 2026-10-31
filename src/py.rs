@@ -495,11 +495,16 @@ impl TiktokenBuffer {
     }
 }
 
+/// Cache UTF-8 views for a complete batch before any encoder work begins.
+#[pyfunction]
+fn _prepare_utf8(_texts: Vec<PyBackedStr>) {}
+
 #[pymodule(gil_used = false)]
 fn _tiktoken(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<CoreBPE>()?;
     m.add_class::<TokenStorageEncoder>()?;
     m.add_class::<TokenStorageDecoder>()?;
+    m.add_function(wrap_pyfunction!(_prepare_utf8, m)?)?;
     m.add_function(wrap_pyfunction!(crate::rmcp_token_bits::_unpack_bits17_into, m)?)?;
     Ok(())
 }
