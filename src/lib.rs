@@ -21,6 +21,10 @@ mod rmcp_token_storage;
 
 pub type Rank = u32;
 
+fn pair_index(left: u8, right: u8) -> usize {
+    (usize::from(left) << 8) | usize::from(right)
+}
+
 use std::collections::BinaryHeap;
 
 #[derive(Eq, PartialEq, Clone, Copy)]
@@ -148,7 +152,9 @@ fn _byte_pair_merge_large(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<R
 
 fn _byte_pair_merge(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<(usize, Rank)> {
     let mut parts = Vec::with_capacity(piece.len() + 1);
-    _byte_pair_merge_into(ranks, piece, &mut parts);
+    _byte_pair_merge_into(ranks, piece, &mut parts, |pair| {
+        *ranks.get(pair).unwrap_or(&Rank::MAX)
+    });
     parts
 }
 
@@ -156,6 +162,7 @@ fn _byte_pair_merge_into(
     ranks: &HashMap<Vec<u8>, Rank>,
     piece: &[u8],
     parts: &mut Vec<(usize, Rank)>,
+    pair_rank: impl Fn(&[u8]) -> Rank,
 ) {
     // Reuse only this encode call's scratch; starts and ranks never carry over.
     parts.clear();
@@ -168,7 +175,7 @@ fn _byte_pair_merge_into(
     // merge priority from token index or to prevent specific token merges.
     let mut min_rank: (Rank, usize) = (Rank::MAX, usize::MAX);
     for i in 0..piece.len() - 1 {
-        let rank = *ranks.get(&piece[i..i + 2]).unwrap_or(&Rank::MAX);
+        let rank = pair_rank(&piece[i..i + 2]);
         if rank < min_rank.0 {
             min_rank = (rank, i);
         }
@@ -340,6 +347,7 @@ const MAX_PIECE_REUSE: usize = 1024;
 #[derive(Clone)]
 pub struct CoreBPE {
     encoder: HashMap<Vec<u8>, Rank>,
+    pair_ranks: Box<[Rank]>,
     special_tokens_encoder: HashMap<String, Rank>,
     decoder: HashMap<Rank, Vec<u8>>,
     special_tokens_decoder: HashMap<Rank, Vec<u8>>,
@@ -489,7 +497,9 @@ impl CoreBPE {
                 }
                 let output_start = ret.len();
                 if piece.len() > 1 && piece.len() < 100 {
-                    _byte_pair_merge_into(&self.encoder, piece, &mut parts);
+                    _byte_pair_merge_into(&self.encoder, piece, &mut parts, |pair| {
+                        self.pair_ranks[pair_index(pair[0], pair[1])]
+                    });
                     last_piece_token_len = parts.len() - 1;
                     if COUNT_ONLY {
                         count += last_piece_token_len;
@@ -762,8 +772,18 @@ impl CoreBPE {
         let mut sorted_token_bytes: Vec<Vec<u8>> = encoder.keys().cloned().collect();
         sorted_token_bytes.sort();
 
+        // Initial adjacent-byte ranks are fixed for this vocabulary. Later
+        // merges still resolve their complete byte spans in the original map.
+        let mut pair_ranks = vec![Rank::MAX; 1 << 16].into_boxed_slice();
+        for (piece, &rank) in &encoder {
+            if let [left, right] = piece.as_slice() {
+                pair_ranks[pair_index(*left, *right)] = rank;
+            }
+        }
+
         Ok(Self {
             encoder,
+            pair_ranks,
             special_tokens_encoder,
             decoder,
             special_tokens_decoder,
@@ -881,6 +901,54 @@ mod owned_batch_tests {
             model.count_tokens(&text, &HashSet::new()).unwrap(),
             expected.len()
         );
+    }
+
+    #[test]
+    fn initial_pair_table_preserves_absence_and_maximum_rank() {
+        let ranks = HashMap::from_iter([
+            (vec![0], Rank::MAX - 1),
+            (vec![255], 0),
+            (vec![0, 255], Rank::MAX),
+            (vec![255, 0], 18),
+            (b"abc".to_vec(), 19),
+        ]);
+        let model = CoreBPE::new_internal(ranks.clone(), HashMap::default(), r".").unwrap();
+        for left in 0..=u8::MAX {
+            for right in 0..=u8::MAX {
+                assert_eq!(
+                    model.pair_ranks[crate::pair_index(left, right)],
+                    ranks.get(&[left, right][..]).copied().unwrap_or(Rank::MAX)
+                );
+            }
+        }
+        let cloned = model.clone();
+        assert_eq!(cloned.pair_ranks[crate::pair_index(0, 255)], Rank::MAX);
+    }
+
+    #[test]
+    fn short_merge_tables_match_original_hash_based_merges() {
+        let model = core(r"[\s\S]+");
+        let mut state = 19_u64;
+        for length in 1..=130 {
+            for _ in 0..12 {
+                let text: String = (0..length)
+                    .map(|_| {
+                        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                        ['a', 'b', 'c', ' ', 'é', '😀'][(state >> 32) as usize % 6]
+                    })
+                    .collect();
+                let expected = model.encoder.get(text.as_bytes()).map_or_else(
+                    || crate::byte_pair_encode(text.as_bytes(), &model.encoder),
+                    |&rank| vec![rank],
+                );
+                assert_eq!(model.encode(&text, &HashSet::new()).unwrap().0, expected);
+                assert_eq!(
+                    model.count_tokens(&text, &HashSet::new()).unwrap(),
+                    expected.len()
+                );
+                assert_eq!(model.encode_ordinary(&text), expected);
+            }
+        }
     }
 
     #[test]
