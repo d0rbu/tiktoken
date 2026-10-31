@@ -12,6 +12,7 @@ mod py;
 #[cfg(any(feature = "python", test))]
 mod rmcp_ranges;
 mod rmcp_regex;
+mod rmcp_rank_index;
 #[cfg(any(feature = "python", test))]
 mod rmcp_source;
 #[cfg(feature = "python")]
@@ -347,6 +348,7 @@ const MAX_PIECE_REUSE: usize = 1024;
 #[derive(Clone)]
 pub struct CoreBPE {
     encoder: HashMap<Vec<u8>, Rank>,
+    rank_index: Option<rmcp_rank_index::RankIndex>,
     pair_ranks: Box<[Rank]>,
     special_tokens_encoder: HashMap<String, Rank>,
     decoder: HashMap<Rank, Vec<u8>>,
@@ -481,12 +483,16 @@ impl CoreBPE {
                 };
 
                 let piece = piece.as_bytes();
-                if let Some(token) = self.encoder.get(piece) {
+                let token = match &self.rank_index {
+                    Some(index) => index.get(piece),
+                    None => self.encoder.get(piece).copied(),
+                };
+                if let Some(token) = token {
                     last_piece_token_len = 1;
                     if COUNT_ONLY {
                         count += 1;
                     } else {
-                        ret.push(*token);
+                        ret.push(token);
                     }
                     continue;
                 }
@@ -781,8 +787,10 @@ impl CoreBPE {
             }
         }
 
+        let rank_index = rmcp_rank_index::RankIndex::new(&encoder);
         Ok(Self {
             encoder,
+            rank_index,
             pair_ranks,
             special_tokens_encoder,
             decoder,
