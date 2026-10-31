@@ -510,6 +510,9 @@ impl CoreBPE {
                     }
                 }
                 if !COUNT_ONLY && reused.len() < MAX_PIECE_REUSE {
+                    if reused.is_empty() {
+                        reused.reserve(64);
+                    }
                     reused.insert(piece, (output_start, ret.len()));
                 }
             }
