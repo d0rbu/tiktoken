@@ -12,6 +12,8 @@ mod py;
 #[cfg(any(feature = "python", test))]
 mod rmcp_ranges;
 mod rmcp_regex;
+mod rmcp_ranks;
+use rmcp_ranks::{EncoderRanks, RankLookup};
 #[cfg(any(feature = "python", test))]
 mod rmcp_source;
 #[cfg(feature = "python")]
@@ -57,7 +59,7 @@ struct State {
     cur_rank: Rank,
 }
 
-fn _byte_pair_merge_large(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<Rank> {
+fn _byte_pair_merge_large(ranks: &impl RankLookup, piece: &[u8]) -> Vec<Rank> {
     let mut state = Vec::with_capacity(piece.len());
     state.push(State {
         prev: usize::MAX,
@@ -150,7 +152,7 @@ fn _byte_pair_merge_large(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<R
     result
 }
 
-fn _byte_pair_merge(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<(usize, Rank)> {
+fn _byte_pair_merge(ranks: &impl RankLookup, piece: &[u8]) -> Vec<(usize, Rank)> {
     let mut parts = Vec::with_capacity(piece.len() + 1);
     _byte_pair_merge_into(ranks, piece, &mut parts, |pair| {
         *ranks.get(pair).unwrap_or(&Rank::MAX)
@@ -159,7 +161,7 @@ fn _byte_pair_merge(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<(usize,
 }
 
 fn _byte_pair_merge_into(
-    ranks: &HashMap<Vec<u8>, Rank>,
+    ranks: &impl RankLookup,
     piece: &[u8],
     parts: &mut Vec<(usize, Rank)>,
     pair_rank: impl Fn(&[u8]) -> Rank,
@@ -223,6 +225,10 @@ fn _byte_pair_merge_into(
 }
 
 pub fn byte_pair_encode(piece: &[u8], ranks: &HashMap<Vec<u8>, Rank>) -> Vec<Rank> {
+    _byte_pair_encode(piece, ranks)
+}
+
+fn _byte_pair_encode(piece: &[u8], ranks: &impl RankLookup) -> Vec<Rank> {
     let piece_len = piece.len();
 
     if piece_len == 1 {
@@ -346,7 +352,7 @@ const MAX_PIECE_REUSE: usize = 1024;
 #[cfg_attr(feature = "python", pyclass(frozen))]
 #[derive(Clone)]
 pub struct CoreBPE {
-    encoder: HashMap<Vec<u8>, Rank>,
+    encoder: EncoderRanks,
     pair_ranks: Box<[Rank]>,
     special_tokens_encoder: HashMap<String, Rank>,
     decoder: HashMap<Rank, Vec<u8>>,
@@ -412,7 +418,7 @@ impl CoreBPE {
             let piece = piece.unwrap().as_bytes();
             match self.encoder.get(piece) {
                 Some(token) => ret.push(*token),
-                None => ret.extend(&byte_pair_encode(piece, &self.encoder)),
+                None => ret.extend(&_byte_pair_encode(piece, &self.encoder)),
             }
         }
         ret
@@ -511,7 +517,7 @@ impl CoreBPE {
                         );
                     }
                 } else {
-                    let tokens = byte_pair_encode(piece, &self.encoder);
+                    let tokens = _byte_pair_encode(piece, &self.encoder);
                     last_piece_token_len = tokens.len();
                     if COUNT_ONLY {
                         count += tokens.len();
@@ -672,7 +678,7 @@ impl CoreBPE {
                     // would be a regex split before the UTF-8 truncation point.
                     // Probably niche enough that no one will ever notice (after all, people didn't
                     // notice all the big holes in the previous unstable token implementation)
-                    Err(_) => byte_pair_encode(&possibility, &self.encoder),
+                    Err(_) => _byte_pair_encode(&possibility, &self.encoder),
                     // Something like the following is intriguing but incorrect:
                     // Err(e) => self.encode_ordinary(unsafe {
                     //     std::str::from_utf8_unchecked(&possibility[..e.valid_up_to()])
@@ -705,11 +711,11 @@ impl CoreBPE {
             if unstable_bytes.len() - last_decoded.1 > 0
                 && last_decoded.0.is_some_and(|c| c.is_whitespace())
             {
-                let mut reencoded = byte_pair_encode(
+                let mut reencoded = _byte_pair_encode(
                     &unstable_bytes[..unstable_bytes.len() - last_decoded.1],
                     &self.encoder,
                 );
-                reencoded.extend(byte_pair_encode(
+                reencoded.extend(_byte_pair_encode(
                     &unstable_bytes[unstable_bytes.len() - last_decoded.1..],
                     &self.encoder,
                 ));
@@ -782,7 +788,7 @@ impl CoreBPE {
         }
 
         Ok(Self {
-            encoder,
+            encoder: EncoderRanks::from(encoder),
             pair_ranks,
             special_tokens_encoder,
             decoder,
@@ -938,7 +944,7 @@ mod owned_batch_tests {
                     })
                     .collect();
                 let expected = model.encoder.get(text.as_bytes()).map_or_else(
-                    || crate::byte_pair_encode(text.as_bytes(), &model.encoder),
+                    || crate::_byte_pair_encode(text.as_bytes(), &model.encoder),
                     |&rank| vec![rank],
                 );
                 assert_eq!(model.encode(&text, &HashSet::new()).unwrap().0, expected);
@@ -989,7 +995,11 @@ mod owned_batch_tests {
     #[test]
     fn piece_reuse_remains_private_between_models_and_threads() {
         let first = core(r"[a-z]+| ");
-        let mut ranks = first.encoder.clone();
+        let mut ranks: HashMap<Vec<u8>, Rank> = first
+            .decoder
+            .iter()
+            .map(|(&rank, bytes)| (bytes.clone(), rank))
+            .collect();
         ranks.insert(b"ab".to_vec(), 700);
         let second = CoreBPE::new_internal(ranks, HashMap::default(), r"[a-z]+| ").unwrap();
         let text = "ababa ababa abcabc abcabc";

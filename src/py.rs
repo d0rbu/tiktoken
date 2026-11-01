@@ -10,7 +10,7 @@ use rustc_hash::FxHashMap as HashMap;
 
 use crate::rmcp_source::{Batch as SourceBatch, Cursor as SourceCursor, ReadError};
 use crate::rmcp_token_storage;
-use crate::{CoreBPE, Rank, byte_pair_encode};
+use crate::{CoreBPE, Rank, _byte_pair_encode};
 
 fn storage_width(width: u8) -> PyResult<u8> {
     match width {
@@ -343,7 +343,7 @@ impl CoreBPE {
                         match self.encoder.get(&unstable_bytes) {
                             Some(token) => tokens.push(*token),
                             None => {
-                                tokens.extend(&byte_pair_encode(&unstable_bytes, &self.encoder))
+                                tokens.extend(&_byte_pair_encode(&unstable_bytes, &self.encoder))
                             }
                         }
                     }
@@ -385,7 +385,7 @@ impl CoreBPE {
         if let Some(token) = self.encoder.get(piece) {
             return vec![*token];
         }
-        byte_pair_encode(piece, &self.encoder)
+        _byte_pair_encode(piece, &self.encoder)
     }
 
     // ====================

@@ -25,6 +25,12 @@ Example code using `tiktoken` can be found in the
 
 ## Performance
 
+The RMCP fork stores vocabulary keys of up to seven bytes in one machine word,
+and keys of eight to fifteen bytes in two words. The encoding includes the exact
+byte length, so embedded or trailing zero bytes remain distinct. Longer keys keep
+their original byte-vector representation. This changes lookup storage only;
+token ranks, merge ordering, special tokens and decoding retain their meanings.
+
 `tiktoken` is between 3-6x faster than a comparable open source tokeniser:
 
 ![image](https://raw.githubusercontent.com/openai/tiktoken/main/perf.svg)
