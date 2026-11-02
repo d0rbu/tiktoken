@@ -39,10 +39,18 @@ fn short_key(bytes: &[u8]) -> u64 {
     word | ((bytes.len() as u64) << 56)
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Eq, Hash)]
 struct MediumKey {
     first: u64,
     tail: u64,
+}
+
+impl PartialEq for MediumKey {
+    #[inline(always)]
+    fn eq(&self, other: &Self) -> bool {
+        // Check both words without a first-word short-circuit branch.
+        ((self.first ^ other.first) | (self.tail ^ other.tail)) == 0
+    }
 }
 
 impl MediumKey {
@@ -124,6 +132,26 @@ impl Index<&[u8]> for EncoderRanks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn medium_equality_checks_both_words() {
+        let key = MediumKey { first: 7, tail: 11 };
+        assert!(key == MediumKey { first: 7, tail: 11 });
+        for bit in 0..64 {
+            assert!(
+                key != MediumKey {
+                    first: 7 ^ (1 << bit),
+                    tail: 11
+                }
+            );
+            assert!(
+                key != MediumKey {
+                    first: 7,
+                    tail: 11 ^ (1 << bit)
+                }
+            );
+        }
+    }
 
     #[test]
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
