@@ -336,15 +336,11 @@ impl CoreBPE {
     ) -> PyResult<(Py<PyAny>, Vec<usize>)> {
         let result = py.detach(|| {
             let allowed: HashSet<&str> = allowed_special.iter().map(|s| s.as_ref()).collect();
-            let rows =
-                self.encode_batch_serial(batch.batch.texts.iter().map(String::as_str), &allowed)?;
-            let lengths: Vec<usize> = rows.iter().map(|row| row.len() + 1).collect();
-            let mut ids = Vec::with_capacity(lengths.iter().sum());
-            for row in rows {
-                ids.extend(row);
-                ids.push(eos);
-            }
-            Ok::<_, crate::EncodeError>((ids, lengths))
+            self.encode_flat_with_eos(
+                batch.batch.texts.iter().map(String::as_str),
+                &allowed,
+                eos,
+            )
         });
         let (ids, lengths) =
             result.map_err(|error| exceptions::PyValueError::new_err(error.message))?;

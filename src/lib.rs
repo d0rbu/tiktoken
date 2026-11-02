@@ -433,7 +433,7 @@ impl CoreBPE {
         text: &str,
         allowed_special: &HashSet<&str>,
     ) -> Result<(Vec<Rank>, usize), EncodeError> {
-        self.encode_with_count::<false>(text, allowed_special)
+        self.encode_with_count::<false>(text, allowed_special, Vec::new())
             .map(|(tokens, last_piece, _)| (tokens, last_piece))
     }
 
@@ -443,7 +443,7 @@ impl CoreBPE {
         text: &str,
         allowed_special: &HashSet<&str>,
     ) -> Result<usize, EncodeError> {
-        self.encode_with_count::<true>(text, allowed_special)
+        self.encode_with_count::<true>(text, allowed_special, Vec::new())
             .map(|(_, _, count)| count)
     }
 
@@ -451,9 +451,9 @@ impl CoreBPE {
         &self,
         text: &str,
         allowed_special: &HashSet<&str>,
+        mut ret: Vec<Rank>,
     ) -> Result<(Vec<Rank>, usize, usize), EncodeError> {
         let special_regex = self._get_tl_special_regex();
-        let mut ret = vec![];
         let mut parts = Vec::new();
         // Only this document owns these borrowed keys and output indices.
         let mut reused: HashMap<&[u8], (usize, usize)> = HashMap::default();
@@ -557,6 +557,24 @@ impl CoreBPE {
         // last_piece_token_len is how many tokens came from the last regex split. This is used
         // for determining unstable tokens, since you can't merge across (stable) regex splits
         Ok((ret, last_piece_token_len, count))
+    }
+
+    #[cfg(any(feature = "python", test))]
+    fn encode_flat_with_eos<'a>(
+        &self,
+        texts: impl Iterator<Item = &'a str>,
+        allowed_special: &HashSet<&str>,
+        eos: Rank,
+    ) -> Result<(Vec<Rank>, Vec<usize>), EncodeError> {
+        let mut ids = Vec::new();
+        let mut lengths = Vec::with_capacity(texts.size_hint().0);
+        for text in texts {
+            let start = ids.len();
+            ids = self.encode_with_count::<false>(text, allowed_special, ids)?.0;
+            ids.push(eos);
+            lengths.push(ids.len() - start);
+        }
+        Ok((ids, lengths))
     }
 
     #[cfg(any(feature = "python", test))]
@@ -1058,6 +1076,20 @@ mod owned_batch_tests {
                     .collect();
                 let actual = model.encode_batch_serial(texts.into_iter(), &allowed).unwrap();
                 assert_eq!(actual, expected);
+                let (flat, lengths) = model
+                    .encode_flat_with_eos(texts.into_iter(), &allowed, 900_000)
+                    .unwrap();
+                assert_eq!(
+                    lengths,
+                    expected.iter().map(|row| row.len() + 1).collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    flat,
+                    expected
+                        .iter()
+                        .flat_map(|row| row.iter().copied().chain([900_000]))
+                        .collect::<Vec<_>>()
+                );
                 for (text, row) in texts.iter().zip(&actual) {
                     assert_eq!(model.decode_bytes(row).unwrap(), text.as_bytes());
                 }
@@ -1066,6 +1098,30 @@ mod owned_batch_tests {
                 assert_eq!(actual[3], [256]);
             }
         }
+    }
+
+    #[test]
+    fn flat_source_output_preserves_nonempty_prefix_reuse_and_empty_batch() {
+        let model = core(include_str!("rmcp_pattern.txt"));
+        let allowed = HashSet::from(["<S>", "<T>"]);
+        let text = "abcdefgh abcdefgh abcdefgh<S>abababa abababa<T>";
+        let expected = model.encode(text, &allowed).unwrap();
+        let prefix = vec![Rank::MAX, 900_001, 900_002];
+        let (actual, last, count) = model
+            .encode_with_count::<false>(text, &allowed, prefix.clone())
+            .unwrap();
+        assert_eq!(&actual[..prefix.len()], prefix);
+        assert_eq!(&actual[prefix.len()..], expected.0);
+        assert_eq!(last, expected.1);
+        assert_eq!(count, 0);
+        assert_eq!(
+            model.encode_flat_with_eos(std::iter::empty(), &allowed, 900_000).unwrap(),
+            (Vec::new(), Vec::new())
+        );
+        assert_eq!(
+            model.encode_flat_with_eos(["", ""].into_iter(), &allowed, Rank::MAX).unwrap(),
+            (vec![Rank::MAX, Rank::MAX], vec![1, 1])
+        );
     }
 
     #[test]
@@ -1107,6 +1163,11 @@ mod owned_batch_tests {
         }));
         let actual = model.encode_batch_serial(texts, &allowed).unwrap_err();
         assert_eq!(actual.message, expected.message);
+        let texts = ["c", bad].into_iter().chain(std::iter::once_with(|| -> &str {
+            panic!("flat source encoding must stop after the first error")
+        }));
+        let flat_error = model.encode_flat_with_eos(texts, &allowed, 900_000).unwrap_err();
+        assert_eq!(flat_error.message, expected.message);
         assert!(actual.message.starts_with("Regex error while tokenizing:"));
         assert_eq!(model.encode_batch_serial(["c"].into_iter(), &allowed).unwrap(), [vec![99]]);
     }
