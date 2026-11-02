@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::collections::hash_map::Entry;
 use std::num::NonZeroU64;
 use std::thread;
 
@@ -500,11 +501,30 @@ impl CoreBPE {
                     }
                     continue;
                 }
-                if !COUNT_ONLY && let Some(&(start, end)) = reused.get(piece) {
-                    last_piece_token_len = end - start;
-                    ret.extend_from_within(start..end);
-                    continue;
-                }
+                let vacant = if COUNT_ONLY {
+                    None
+                } else if reused.len() >= MAX_PIECE_REUSE {
+                    // At the cap, retain read access without reserving another entry.
+                    if let Some(&(start, end)) = reused.get(piece) {
+                        last_piece_token_len = end - start;
+                        ret.extend_from_within(start..end);
+                        continue;
+                    }
+                    None
+                } else {
+                    if reused.is_empty() {
+                        reused.reserve(64);
+                    }
+                    match reused.entry(piece) {
+                        Entry::Occupied(previous) => {
+                            let &(start, end) = previous.get();
+                            last_piece_token_len = end - start;
+                            ret.extend_from_within(start..end);
+                            continue;
+                        }
+                        Entry::Vacant(vacant) => Some(vacant),
+                    }
+                };
                 let output_start = ret.len();
                 if piece.len() > 1 && piece.len() < 100 {
                     _byte_pair_merge_into(&self.encoder, piece, &mut parts, |pair| {
@@ -529,11 +549,8 @@ impl CoreBPE {
                         ret.extend(&tokens);
                     }
                 }
-                if !COUNT_ONLY && reused.len() < MAX_PIECE_REUSE {
-                    if reused.is_empty() {
-                        reused.reserve(64);
-                    }
-                    reused.insert(piece, (output_start, ret.len()));
+                if let Some(vacant) = vacant {
+                    vacant.insert((output_start, ret.len()));
                 }
             }
 
@@ -994,6 +1011,28 @@ mod owned_batch_tests {
             model.count_tokens(&text, &HashSet::new()).unwrap(),
             expected.len()
         );
+    }
+
+    #[test]
+    fn piece_reuse_entry_cap_and_specials_match_uncached_segments() {
+        let model = core(r"[^ ]+| ");
+        let allowed = HashSet::from(["<S>"]);
+        for unique in [0, 1, 1023, 1024, 1025, 1100] {
+            let words: Vec<_> = (0..unique).map(|index| format!("{index:012b}")).collect();
+            let before = format!("ababa {} ababa", words.join(" "));
+            let after = format!(
+                "ababa {} ababa",
+                words.iter().rev().cloned().collect::<Vec<_>>().join(" ")
+            );
+            let text = format!("{before}<S>{after}");
+            let mut expected = model.encode_ordinary(&before);
+            expected.push(model.special_tokens_encoder["<S>"]);
+            expected.extend(model.encode_ordinary(&after));
+            let actual = model.encode(&text, &allowed).unwrap().0;
+            assert_eq!(actual, expected, "cache boundary {unique}");
+            assert_eq!(model.decode_bytes(&actual).unwrap(), text.as_bytes());
+            assert_eq!(model.count_tokens(&text, &allowed).unwrap(), expected.len());
+        }
     }
 
     #[test]
