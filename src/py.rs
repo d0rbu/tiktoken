@@ -1,16 +1,39 @@
 use std::collections::HashSet;
 
 use pyo3::{
-    IntoPyObjectExt, PyResult, exceptions,
+    Borrowed, IntoPyObjectExt, PyResult, exceptions,
     prelude::*,
     pybacked::PyBackedStr,
-    types::{PyBytes, PyList},
+    types::{PyBytes, PyDict, PyList},
 };
 use rustc_hash::FxHashMap as HashMap;
+use smallvec::SmallVec;
 
 use crate::rmcp_source::{Batch as SourceBatch, Cursor as SourceCursor, ReadError};
 use crate::rmcp_token_storage;
-use crate::{CoreBPE, Rank, byte_pair_encode};
+use crate::{CoreBPE, Rank, byte_pair_encode_impl};
+
+// Match PyO3's HashMap extraction order, building the final key storage once.
+struct InlineVocabulary(HashMap<SmallVec<[u8; 16]>, Rank>);
+
+impl<'py> FromPyObject<'_, 'py> for InlineVocabulary {
+    type Error = PyErr;
+
+    fn extract(ob: Borrowed<'_, 'py, PyAny>) -> PyResult<Self> {
+        let dict = ob.cast::<PyDict>()?;
+        let mut encoder = HashMap::with_capacity_and_hasher(dict.len(), Default::default());
+        for (key, value) in dict.iter() {
+            let bytes = if key.is_exact_instance_of::<PyBytes>() {
+                SmallVec::from_slice(key.cast::<PyBytes>()?.as_bytes())
+            } else {
+                SmallVec::from_vec(key.extract::<Vec<u8>>()?)
+            };
+            let rank = value.extract::<Rank>()?;
+            encoder.insert(bytes, rank);
+        }
+        Ok(Self(encoder))
+    }
+}
 
 fn storage_width(width: u8) -> PyResult<u8> {
     match width {
@@ -188,11 +211,11 @@ impl CoreBPE {
 
     #[new]
     fn py_new(
-        encoder: HashMap<Vec<u8>, Rank>,
+        encoder: InlineVocabulary,
         special_tokens_encoder: HashMap<String, Rank>,
         pattern: &str,
     ) -> PyResult<Self> {
-        Self::new_internal(encoder, special_tokens_encoder, pattern)
+        Self::new_inline_internal(encoder.0, special_tokens_encoder, pattern)
             .map_err(|e| PyErr::new::<exceptions::PyValueError, _>(e.to_string()))
     }
 
@@ -340,11 +363,10 @@ impl CoreBPE {
                     }
 
                     if !unstable_bytes.is_empty() {
-                        match self.encoder.get(&unstable_bytes) {
+                        match self.encoder.get(unstable_bytes.as_slice()) {
                             Some(token) => tokens.push(*token),
-                            None => {
-                                tokens.extend(&byte_pair_encode(&unstable_bytes, &self.encoder))
-                            }
+                            None => tokens
+                                .extend(&byte_pair_encode_impl(&unstable_bytes, &self.encoder)),
                         }
                     }
                     tokens
@@ -385,7 +407,7 @@ impl CoreBPE {
         if let Some(token) = self.encoder.get(piece) {
             return vec![*token];
         }
-        byte_pair_encode(piece, &self.encoder)
+        byte_pair_encode_impl(piece, &self.encoder)
     }
 
     // ====================

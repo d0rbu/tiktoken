@@ -1,4 +1,6 @@
+use std::borrow::Borrow;
 use std::collections::HashSet;
+use std::hash::Hash;
 use std::num::NonZeroU64;
 use std::thread;
 
@@ -6,6 +8,7 @@ use fancy_regex::Regex;
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
 use rustc_hash::FxHashMap as HashMap;
+use smallvec::SmallVec;
 
 #[cfg(feature = "python")]
 mod py;
@@ -57,7 +60,10 @@ struct State {
     cur_rank: Rank,
 }
 
-fn _byte_pair_merge_large(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<Rank> {
+fn _byte_pair_merge_large<K: Borrow<[u8]> + Eq + Hash>(
+    ranks: &HashMap<K, Rank>,
+    piece: &[u8],
+) -> Vec<Rank> {
     let mut state = Vec::with_capacity(piece.len());
     state.push(State {
         prev: usize::MAX,
@@ -150,7 +156,10 @@ fn _byte_pair_merge_large(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<R
     result
 }
 
-fn _byte_pair_merge(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<(usize, Rank)> {
+fn _byte_pair_merge<K: Borrow<[u8]> + Eq + Hash>(
+    ranks: &HashMap<K, Rank>,
+    piece: &[u8],
+) -> Vec<(usize, Rank)> {
     let mut parts = Vec::with_capacity(piece.len() + 1);
     _byte_pair_merge_into(ranks, piece, &mut parts, |pair| {
         *ranks.get(pair).unwrap_or(&Rank::MAX)
@@ -158,8 +167,8 @@ fn _byte_pair_merge(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<(usize,
     parts
 }
 
-fn _byte_pair_merge_into(
-    ranks: &HashMap<Vec<u8>, Rank>,
+fn _byte_pair_merge_into<K: Borrow<[u8]> + Eq + Hash>(
+    ranks: &HashMap<K, Rank>,
     piece: &[u8],
     parts: &mut Vec<(usize, Rank)>,
     pair_rank: impl Fn(&[u8]) -> Rank,
@@ -223,6 +232,13 @@ fn _byte_pair_merge_into(
 }
 
 pub fn byte_pair_encode(piece: &[u8], ranks: &HashMap<Vec<u8>, Rank>) -> Vec<Rank> {
+    byte_pair_encode_impl(piece, ranks)
+}
+
+fn byte_pair_encode_impl<K: Borrow<[u8]> + Eq + Hash>(
+    piece: &[u8],
+    ranks: &HashMap<K, Rank>,
+) -> Vec<Rank> {
     let piece_len = piece.len();
 
     if piece_len == 1 {
@@ -346,7 +362,7 @@ const MAX_PIECE_REUSE: usize = 1024;
 #[cfg_attr(feature = "python", pyclass(frozen))]
 #[derive(Clone)]
 pub struct CoreBPE {
-    encoder: HashMap<Vec<u8>, Rank>,
+    encoder: HashMap<SmallVec<[u8; 16]>, Rank>,
     pair_ranks: Box<[Rank]>,
     special_tokens_encoder: HashMap<String, Rank>,
     decoder: HashMap<Rank, Vec<u8>>,
@@ -412,7 +428,7 @@ impl CoreBPE {
             let piece = piece.unwrap().as_bytes();
             match self.encoder.get(piece) {
                 Some(token) => ret.push(*token),
-                None => ret.extend(&byte_pair_encode(piece, &self.encoder)),
+                None => ret.extend(&byte_pair_encode_impl(piece, &self.encoder)),
             }
         }
         ret
@@ -511,7 +527,7 @@ impl CoreBPE {
                         );
                     }
                 } else {
-                    let tokens = byte_pair_encode(piece, &self.encoder);
+                    let tokens = byte_pair_encode_impl(piece, &self.encoder);
                     last_piece_token_len = tokens.len();
                     if COUNT_ONLY {
                         count += tokens.len();
@@ -660,7 +676,7 @@ impl CoreBPE {
             {
                 let possibility = [prefix, self.sorted_token_bytes[point].as_slice()].concat();
                 let encoded = match std::str::from_utf8(&possibility) {
-                    // Morally, this is byte_pair_encode(&possibility, &self.encoder)
+                    // Morally, this is byte_pair_encode_impl(&possibility, &self.encoder)
                     // But we might have introduced a regex split which would prevent merges.
                     // (particularly possible in the presence of unstable regex splits)
                     // So convert to UTF-8 and do regex splitting.
@@ -672,7 +688,7 @@ impl CoreBPE {
                     // would be a regex split before the UTF-8 truncation point.
                     // Probably niche enough that no one will ever notice (after all, people didn't
                     // notice all the big holes in the previous unstable token implementation)
-                    Err(_) => byte_pair_encode(&possibility, &self.encoder),
+                    Err(_) => byte_pair_encode_impl(&possibility, &self.encoder),
                     // Something like the following is intriguing but incorrect:
                     // Err(e) => self.encode_ordinary(unsafe {
                     //     std::str::from_utf8_unchecked(&possibility[..e.valid_up_to()])
@@ -705,11 +721,11 @@ impl CoreBPE {
             if unstable_bytes.len() - last_decoded.1 > 0
                 && last_decoded.0.is_some_and(|c| c.is_whitespace())
             {
-                let mut reencoded = byte_pair_encode(
+                let mut reencoded = byte_pair_encode_impl(
                     &unstable_bytes[..unstable_bytes.len() - last_decoded.1],
                     &self.encoder,
                 );
-                reencoded.extend(byte_pair_encode(
+                reencoded.extend(byte_pair_encode_impl(
                     &unstable_bytes[unstable_bytes.len() - last_decoded.1..],
                     &self.encoder,
                 ));
@@ -742,6 +758,18 @@ impl CoreBPE {
         special_tokens_encoder: HashMap<String, Rank>,
         pattern: &str,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let encoder = encoder
+            .into_iter()
+            .map(|(bytes, rank)| (SmallVec::from_vec(bytes), rank))
+            .collect();
+        Self::new_inline_internal(encoder, special_tokens_encoder, pattern)
+    }
+
+    fn new_inline_internal(
+        encoder: HashMap<SmallVec<[u8; 16]>, Rank>,
+        special_tokens_encoder: HashMap<String, Rank>,
+        pattern: &str,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let regex = Regex::new(pattern)?;
         let regular_regex = rmcp_regex::compile_if_guarded(pattern)?;
 
@@ -754,7 +782,7 @@ impl CoreBPE {
         };
 
         let decoder: HashMap<Rank, Vec<u8>> =
-            encoder.iter().map(|(k, v)| (*v, k.clone())).collect();
+            encoder.iter().map(|(k, v)| (*v, k.to_vec())).collect();
 
         assert!(
             encoder.len() == decoder.len(),
@@ -769,7 +797,8 @@ impl CoreBPE {
             .collect();
 
         // Clone because I don't know how to tell Rust I'm not going to change the map
-        let mut sorted_token_bytes: Vec<Vec<u8>> = encoder.keys().cloned().collect();
+        let mut sorted_token_bytes: Vec<Vec<u8>> =
+            encoder.keys().map(|bytes| bytes.to_vec()).collect();
         sorted_token_bytes.sort();
 
         // Initial adjacent-byte ranks are fixed for this vocabulary. Later
@@ -938,7 +967,7 @@ mod owned_batch_tests {
                     })
                     .collect();
                 let expected = model.encoder.get(text.as_bytes()).map_or_else(
-                    || crate::byte_pair_encode(text.as_bytes(), &model.encoder),
+                    || crate::byte_pair_encode_impl(text.as_bytes(), &model.encoder),
                     |&rank| vec![rank],
                 );
                 assert_eq!(model.encode(&text, &HashSet::new()).unwrap().0, expected);
@@ -989,7 +1018,11 @@ mod owned_batch_tests {
     #[test]
     fn piece_reuse_remains_private_between_models_and_threads() {
         let first = core(r"[a-z]+| ");
-        let mut ranks = first.encoder.clone();
+        let mut ranks: HashMap<Vec<u8>, Rank> = first
+            .encoder
+            .iter()
+            .map(|(bytes, &rank)| (bytes.to_vec(), rank))
+            .collect();
         ranks.insert(b"ab".to_vec(), 700);
         let second = CoreBPE::new_internal(ranks, HashMap::default(), r"[a-z]+| ").unwrap();
         let text = "ababa ababa abcabc abcabc";
@@ -1121,5 +1154,104 @@ mod tests {
         let ranks = setup_ranks();
         let res = byte_pair_split(b"abab", &ranks);
         assert_eq!(res, vec![b"ab", b"ab"]);
+    }
+}
+
+#[cfg(test)]
+mod inline_key_tests {
+    use std::collections::HashSet;
+    use std::hash::{Hash, Hasher};
+
+    use rustc_hash::{FxHashMap, FxHasher};
+    use smallvec::SmallVec;
+
+    use crate::{CoreBPE, Rank, byte_pair_encode, byte_pair_encode_impl};
+
+    type Key = SmallVec<[u8; 16]>;
+
+    fn hash(value: &impl Hash) -> u64 {
+        let mut hasher = FxHasher::default();
+        value.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    #[test]
+    fn borrowed_lookup_hashes_match_across_inline_and_heap_boundaries() {
+        assert_eq!(std::mem::size_of::<Key>(), std::mem::size_of::<Vec<u8>>());
+        for length in 0..=96 {
+            let bytes: Vec<u8> = (0..length).map(|i| (i * 17 + 128) as u8).collect();
+            let key = Key::from_vec(bytes.clone());
+            assert_eq!(key.spilled(), length > 16);
+            assert_eq!(hash(&key), hash(&bytes));
+            assert_eq!(hash(&key), hash(&bytes.as_slice()));
+            let ranks = FxHashMap::from_iter([(key, length as Rank)]);
+            assert_eq!(ranks.get(bytes.as_slice()), Some(&(length as Rank)));
+            let mut changed = bytes;
+            changed.push(0);
+            assert_eq!(ranks.get(changed.as_slice()), None);
+        }
+    }
+
+    #[test]
+    fn spare_capacity_does_not_change_key_equality_or_lookup() {
+        let bytes = b"\x00\xffab";
+        let inline = Key::from_slice(bytes);
+        let mut spare = Vec::with_capacity(128);
+        spare.extend_from_slice(bytes);
+        let heap = Key::from_vec(spare);
+        assert!(!inline.spilled());
+        assert!(heap.spilled());
+        assert_eq!(hash(&inline), hash(&heap));
+        assert_eq!(inline, heap);
+        let mut ranks = FxHashMap::from_iter([(inline, 37_u32)]);
+        assert_eq!(ranks.insert(heap, 41), Some(37));
+        assert_eq!(ranks.len(), 1);
+        assert_eq!(ranks.get(bytes.as_slice()), Some(&41));
+    }
+
+    #[test]
+    fn mixed_key_vocabularies_preserve_full_ids_counts_and_decoder() {
+        let mut ranks: FxHashMap<Vec<u8>, Rank> = (0_u16..256)
+            .map(|byte| (vec![byte as u8], byte as Rank))
+            .collect();
+        for (index, bytes) in [
+            b"ab".as_slice(),
+            b"abc",
+            b"abcd",
+            b"abcdefgh",
+            b"abcdefghijklmnop",
+            b"abcdefghijklmnopq",
+            b"abcdefghijklmnopabcdefghijklmnop",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            ranks.insert(bytes.to_vec(), 256 + index as Rank);
+        }
+        let model = CoreBPE::new_internal(ranks.clone(), FxHashMap::default(), r"(?s).+").unwrap();
+        for text in [
+            String::from("a"),
+            String::from("abcabcab"),
+            String::from("abcdefghijklmnop"),
+            String::from("abcdefghijklmnopq"),
+            "abcdefghijklmnop".repeat(20),
+            String::from("éé🙂abcdef\nÿ"),
+        ] {
+            let merged = byte_pair_encode(text.as_bytes(), &ranks);
+            assert_eq!(
+                byte_pair_encode_impl(text.as_bytes(), &model.encoder),
+                merged
+            );
+            let expected = ranks
+                .get(text.as_bytes())
+                .map_or_else(|| merged, |&rank| vec![rank]);
+            assert_eq!(model.encode_ordinary(&text), expected);
+            assert_eq!(model.encode(&text, &HashSet::new()).unwrap().0, expected);
+            assert_eq!(
+                model.count_tokens(&text, &HashSet::new()).unwrap(),
+                expected.len()
+            );
+            assert_eq!(model.decode_bytes(&expected).unwrap(), text.as_bytes());
+        }
     }
 }
