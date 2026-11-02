@@ -382,7 +382,7 @@ impl CoreBPE {
     fn _ordinary_pieces<'a>(
         &'a self,
         text: &'a str,
-    ) -> impl Iterator<Item = Result<&'a str, fancy_regex::Error>> {
+    ) -> rmcp_regex::Pieces<'a, 'a, impl Iterator<Item = Result<&'a str, fancy_regex::Error>>> {
         match &self.regular_regex_tls {
             Some(regexes) => rmcp_regex::Pieces::Regular(rmcp_regex::RegularPieces::new(
                 &regexes[hash_current_thread() % MAX_NUM_THREADS],
@@ -480,8 +480,9 @@ impl CoreBPE {
             let end = next_special.map_or(text.len(), |m| m.start());
 
             // Okay, here we go, compare this logic to encode_ordinary
-            for piece_res in self._ordinary_pieces(&text[start..end]) {
-                let piece = match piece_res {
+            let mut pieces = self._ordinary_pieces(&text[start..end]);
+            while let Some(piece_res) = pieces.next_rank(&self.encoder) {
+                let (piece, direct_rank) = match piece_res {
                     Ok(piece) => piece,
                     Err(e) => {
                         return Err(EncodeError {
@@ -491,7 +492,7 @@ impl CoreBPE {
                 };
 
                 let piece = piece.as_bytes();
-                if let Some(token) = self.encoder.get(piece) {
+                if let Some(token) = direct_rank {
                     last_piece_token_len = 1;
                     if COUNT_ONLY {
                         count += 1;

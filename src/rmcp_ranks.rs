@@ -91,6 +91,13 @@ impl From<HashMap<Vec<u8>, Rank>> for EncoderRanks {
 }
 
 impl EncoderRanks {
+    /// Caller supplies a nonempty 1..=7-byte prefix in the low word bytes.
+    #[inline(always)]
+    pub(crate) fn get_short_word(&self, word: u64, length: usize) -> Option<&Rank> {
+        let key = (word & ((1_u64 << (length * 8)) - 1)) | ((length as u64) << 56);
+        self.short.get(&key)
+    }
+
     #[inline(always)]
     pub(crate) fn get(&self, bytes: &[u8]) -> Option<&Rank> {
         match bytes.len() {
@@ -124,6 +131,30 @@ impl Index<&[u8]> for EncoderRanks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loaded_short_word_ignores_all_suffix_bytes_and_keeps_exact_length() {
+        let mut original = HashMap::default();
+        let mut word = 14_u64;
+        for _ in 0..4096 {
+            word = word.wrapping_mul(6364136223846793005).wrapping_add(1);
+            for len in 1..=7 {
+                original.insert(word.to_le_bytes()[..len].to_vec(), word as Rank);
+            }
+        }
+        original.insert(vec![0; 7], Rank::MAX);
+        original.insert(vec![0], 0);
+        let ranks = EncoderRanks::from(original.clone());
+        for (bytes, rank) in original {
+            for fill in [0, 19, 128, 255] {
+                let mut full = [fill; 8];
+                full[..bytes.len()].copy_from_slice(&bytes);
+                assert_eq!(ranks.get_short_word(u64::from_le_bytes(full), bytes.len()), Some(&rank));
+            }
+        }
+        assert_eq!(ranks.get_short_word(0x01010101, 7), ranks.get(&[1, 1, 1, 1, 0, 0, 0]));
+    }
+
 
     #[test]
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
