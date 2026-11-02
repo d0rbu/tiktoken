@@ -13,6 +13,11 @@ if TYPE_CHECKING:
     import numpy.typing as npt
 
 
+def _prepare_utf8(texts: Sequence[str]) -> None:
+    """Prepare a complete batch's UTF-8 views, raising before any tokenization."""
+    _tiktoken._prepare_utf8(texts)
+
+
 class Encoding:
     def __init__(
         self,
