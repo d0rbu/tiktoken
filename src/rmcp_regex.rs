@@ -12,7 +12,10 @@ use regex_automata::{
     Anchored, Input, MatchError, MatchKind,
     hybrid::dfa,
     nfa::thompson,
-    util::{pool::{Pool, PoolGuard}, syntax},
+    util::{
+        pool::{Pool, PoolGuard},
+        syntax,
+    },
 };
 
 type CacheFactory = Box<dyn Fn() -> dfa::Cache + Send + Sync + UnwindSafe + RefUnwindSafe>;
@@ -28,7 +31,11 @@ impl RegularRegex {
     fn from_dfa(dfa: Arc<dfa::DFA>) -> Self {
         let shared = Arc::clone(&dfa);
         let create: CacheFactory = Box::new(move || shared.create_cache());
-        Self { dfa, caches: Pool::new(create), ascii_guarded: false }
+        Self {
+            dfa,
+            caches: Pool::new(create),
+            ascii_guarded: false,
+        }
     }
 }
 
@@ -116,6 +123,51 @@ fn ascii_class(byte: u8) -> u8 {
     }
 }
 
+#[inline]
+fn ascii_alphanumeric_run<const LETTERS: bool>(bytes: &[u8]) -> usize {
+    let mut end = 0;
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::{
+            __m128i, _mm_and_si128, _mm_cmpgt_epi8, _mm_loadu_si128, _mm_movemask_epi8,
+            _mm_or_si128, _mm_set1_epi8,
+        };
+        while bytes.len() - end >= 16 {
+            // SSE2 is baseline on x86-64. The length check bounds all 16 bytes;
+            // high-bit bytes fail the signed lower-bound comparison.
+            let mask = unsafe {
+                let raw = _mm_loadu_si128(bytes.as_ptr().add(end).cast::<__m128i>());
+                let values = if LETTERS {
+                    _mm_or_si128(raw, _mm_set1_epi8(32))
+                } else {
+                    raw
+                };
+                let low = _mm_set1_epi8(if LETTERS { 96 } else { 47 });
+                let high = _mm_set1_epi8(if LETTERS { 123 } else { 58 });
+                _mm_movemask_epi8(_mm_and_si128(
+                    _mm_cmpgt_epi8(values, low),
+                    _mm_cmpgt_epi8(high, values),
+                )) as u32
+            };
+            let boundary = (!mask) & 0xffff;
+            if boundary != 0 {
+                return end + boundary.trailing_zeros() as usize;
+            }
+            end += 16;
+        }
+    }
+    while end < bytes.len()
+        && if LETTERS {
+            bytes[end].is_ascii_alphabetic()
+        } else {
+            bytes[end].is_ascii_digit()
+        }
+    {
+        end += 1;
+    }
+    end
+}
+
 /// The exact guarded alternatives on ASCII. A non-ASCII boundary delegates
 /// the entire piece, since its Unicode class can extend the current run.
 fn ascii_piece_len(text: &str) -> Option<usize> {
@@ -134,15 +186,17 @@ fn ascii_piece_len(text: &str) -> Option<usize> {
         return None;
     }
     let mut end = begin + 1;
-    while end < bytes.len() {
-        let next = ascii_class(bytes[end]);
-        if next == 4 {
-            return None;
+    match class {
+        1 => end += ascii_alphanumeric_run::<true>(&bytes[end..]),
+        2 => end += ascii_alphanumeric_run::<false>(&bytes[end..]),
+        _ => {
+            while end < bytes.len() && ascii_class(bytes[end]) == class {
+                end += 1;
+            }
         }
-        if next != class {
-            break;
-        }
-        end += 1;
+    }
+    if end < bytes.len() && !bytes[end].is_ascii() {
+        return None;
     }
     // EOF means the end of this ordinary segment, including before a special.
     if class == 0 && end < bytes.len() && end > 1 {
@@ -238,7 +292,9 @@ impl<'t> Iterator for RegularPieces<'_, 't> {
         if start == self.text.len() {
             return None;
         }
-        if self.regex.ascii_guarded && let Some(length) = ascii_piece_len(&self.text[start..]) {
+        if self.regex.ascii_guarded
+            && let Some(length) = ascii_piece_len(&self.text[start..])
+        {
             let end = start + length;
             self.input.set_start(end);
             return Some(&self.text[start..end]);
@@ -281,10 +337,34 @@ mod tests {
 
     use regex_automata::Anchored;
 
-    use super::{GUARDED_PATTERN, RegularRegex, RegularPieces, build_regular_regex, compile_if_guarded, is_guarded_whitespace};
+    use super::{
+        GUARDED_PATTERN, RegularPieces, RegularRegex, build_regular_regex, compile_if_guarded,
+        is_guarded_whitespace,
+    };
     use crate::{CoreBPE, HashMap, Rank};
 
     const GUARDED_WHITESPACE: &str = r"\x{9}-\x{d}\x{20}\x{85}\x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}-\x{2029}\x{202f}\x{205f}\x{3000}";
+
+    #[test]
+    fn vector_runs_preserve_boundaries_and_unicode_fallback() {
+        let (original, regular) = matchers();
+        for length in [0, 1, 2, 7, 14, 15, 16, 17, 30, 31, 32, 33, 63, 64, 65, 127] {
+            for word in ["a", "Z", "0", "9", "aZ", "09"] {
+                for prefix in ["", " ", "'re "] {
+                    for suffix in [
+                        "", "A", "0", "!", "\0", " ", "\t", "é", "中", "١", "\u{301}", "\u{3000}",
+                        "😀", "'s",
+                    ] {
+                        assert_spans_equal(
+                            &original,
+                            &regular,
+                            &format!("{prefix}{}{suffix}", word.repeat(length)),
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn ascii_pairs_contractions_and_unicode_boundaries_match_fancy_regex() {
@@ -333,8 +413,9 @@ mod tests {
     }
 
     fn core(pattern: &str) -> CoreBPE {
-        let mut ranks: HashMap<Vec<u8>, Rank> =
-            (0_u16..256).map(|byte| (vec![byte as u8], byte as Rank)).collect();
+        let mut ranks: HashMap<Vec<u8>, Rank> = (0_u16..256)
+            .map(|byte| (vec![byte as u8], byte as Rank))
+            .collect();
         // These merges expose changed whitespace/contraction piece boundaries.
         for (offset, bytes) in [b" '".as_slice(), b"'s", b"  ", b" a"].iter().enumerate() {
             ranks.insert(bytes.to_vec(), 256 + offset as Rank);
@@ -359,7 +440,11 @@ mod tests {
     #[test]
     fn exact_whitespace_classifier_matches_every_unicode_scalar() {
         let whitespace = GUARDED_PATTERN.rsplit_once('|').unwrap().1;
-        let class = whitespace.strip_prefix('[').unwrap().strip_suffix("]+").unwrap();
+        let class = whitespace
+            .strip_prefix('[')
+            .unwrap()
+            .strip_suffix("]+")
+            .unwrap();
         assert_eq!(class, GUARDED_WHITESPACE);
         let exact_class = regex::Regex::new(&format!(r"\A[{class}]\z")).unwrap();
         let mut count = 0;
@@ -383,16 +468,20 @@ mod tests {
         assert_eq!(regular.dfa.get_nfa().group_info().all_group_len(), 0);
         for scalar in [
             '\u{9}', '\u{a}', '\u{b}', '\u{c}', '\u{d}', ' ', '\u{85}', '\u{a0}', '\u{1680}',
-            '\u{2000}', '\u{2001}', '\u{2002}', '\u{2003}', '\u{2004}', '\u{2005}',
-            '\u{2006}', '\u{2007}', '\u{2008}', '\u{2009}', '\u{200a}', '\u{2028}',
-            '\u{2029}', '\u{202f}', '\u{205f}', '\u{3000}', '\u{1c}', '\u{1f}',
-            '\u{200b}', '\u{feff}', 'é', '३', '\u{301}', '😀', '\'', '!',
+            '\u{2000}', '\u{2001}', '\u{2002}', '\u{2003}', '\u{2004}', '\u{2005}', '\u{2006}',
+            '\u{2007}', '\u{2008}', '\u{2009}', '\u{200a}', '\u{2028}', '\u{2029}', '\u{202f}',
+            '\u{205f}', '\u{3000}', '\u{1c}', '\u{1f}', '\u{200b}', '\u{feff}', 'é', '३',
+            '\u{301}', '😀', '\'', '!',
         ] {
             for suffix in ["", "a", "1", "!", "'s", "'re", "'S", "<S>"] {
                 let text = format!("a{scalar} {scalar}{suffix}");
                 for piece in RegularPieces::new(&regular, &text) {
                     let last = piece.chars().next_back().unwrap();
-                    assert_eq!(is_guarded_whitespace(last), piece.chars().all(is_guarded_whitespace), "piece {piece:?}");
+                    assert_eq!(
+                        is_guarded_whitespace(last),
+                        piece.chars().all(is_guarded_whitespace),
+                        "piece {piece:?}"
+                    );
                 }
                 assert_spans_equal(&original, &regular, &text);
             }
@@ -403,34 +492,74 @@ mod tests {
     fn contractions_restart_at_withheld_scalar() {
         let (original, regular) = matchers();
         for text in [
-            "  's", "\t 's", " \t's", "\u{a0} 's", "  're", "  'll", "  'S", "a  'd!",
-            "  't", "  've", "  'm", "   '!", " 's", "\t's",
+            "  's",
+            "\t 's",
+            " \t's",
+            "\u{a0} 's",
+            "  're",
+            "  'll",
+            "  'S",
+            "a  'd!",
+            "  't",
+            "  've",
+            "  'm",
+            "   '!",
+            " 's",
+            "\t's",
         ] {
             assert_spans_equal(&original, &regular, text);
         }
-        assert_eq!(RegularPieces::new(&regular, "  's").collect::<Vec<_>>(), [" ", " '", "s"]);
-        assert_eq!(RegularPieces::new(&regular, "\t 's").collect::<Vec<_>>(), ["\t", " '", "s"]);
+        assert_eq!(
+            RegularPieces::new(&regular, "  's").collect::<Vec<_>>(),
+            [" ", " '", "s"]
+        );
+        assert_eq!(
+            RegularPieces::new(&regular, "\t 's").collect::<Vec<_>>(),
+            ["\t", " '", "s"]
+        );
     }
 
     #[test]
     fn eof_and_single_scalar_whitespace_make_progress() {
         let (original, regular) = matchers();
         for text in [
-            "", " ", "  ", "\t", "\n\t ", "\u{a0}", "\u{2003}\u{3000}", "a \t\u{a0}",
-            "\t!", "\u{2003}a", " \u{2003}a", "\u{2003} a", "\r\n!",
+            "",
+            " ",
+            "  ",
+            "\t",
+            "\n\t ",
+            "\u{a0}",
+            "\u{2003}\u{3000}",
+            "a \t\u{a0}",
+            "\t!",
+            "\u{2003}a",
+            " \u{2003}a",
+            "\u{2003} a",
+            "\r\n!",
         ] {
             assert_spans_equal(&original, &regular, text);
         }
-        assert_eq!(RegularPieces::new(&regular, " \t\u{a0}").collect::<Vec<_>>(), [" \t\u{a0}"]);
+        assert_eq!(
+            RegularPieces::new(&regular, " \t\u{a0}").collect::<Vec<_>>(),
+            [" \t\u{a0}"]
+        );
     }
 
     #[test]
     fn explicit_unicode_classes_and_utf8_boundaries_match() {
         let (original, regular) = matchers();
         for text in [
-            "élève 中文 １２३", "a\u{301} 𝟠!😀", "\u{85}\u{a0}'s", "\u{1680}\u{2003}x",
-            "\u{2028}\u{2029}'re", "\u{202f}\u{205f}7", "\u{3000} 😀", "\u{200b}\u{feff}x",
-            "\u{0}a\u{10ffff}", "\u{1c}\u{1f} a", "\u{e000}\u{fdd0}",
+            "élève 中文 １２३",
+            "a\u{301} 𝟠!😀",
+            "\u{85}\u{a0}'s",
+            "\u{1680}\u{2003}x",
+            "\u{2028}\u{2029}'re",
+            "\u{202f}\u{205f}7",
+            "\u{3000} 😀",
+            "\u{200b}\u{feff}x",
+            "\u{0}a\u{10ffff}",
+            "\u{1c}\u{1f} a",
+            "\u{e000}\u{fdd0}",
         ] {
             assert_spans_equal(&original, &regular, text);
         }
@@ -443,12 +572,20 @@ mod tests {
         for segment in text.split("<S>").flat_map(|part| part.split("<T>")) {
             assert_spans_equal(&original, &regular, segment);
         }
-        assert_eq!(RegularPieces::new(&regular, "x \t\u{a0}").collect::<Vec<_>>(), ["x", " \t\u{a0}"]);
+        assert_eq!(
+            RegularPieces::new(&regular, "x \t\u{a0}").collect::<Vec<_>>(),
+            ["x", " \t\u{a0}"]
+        );
     }
 
     #[test]
     fn bounded_exhaustive_actual_pattern_spans_match() {
-        fn visit(original: &fancy_regex::Regex, regular: &RegularRegex, text: &mut String, remaining: usize) -> usize {
+        fn visit(
+            original: &fancy_regex::Regex,
+            regular: &RegularRegex,
+            text: &mut String,
+            remaining: usize,
+        ) -> usize {
             assert_spans_equal(original, regular, text);
             let mut count = 1;
             if remaining > 0 {
@@ -471,14 +608,35 @@ mod tests {
         let original = core(&format!("(?:{GUARDED_PATTERN})"));
         assert!(candidate.regular_regex_tls.is_some());
         assert!(original.regular_regex_tls.is_none());
-        let allowed_sets = [HashSet::new(), HashSet::from(["<S>"]), HashSet::from(["<S>", "<T>"])];
+        let allowed_sets = [
+            HashSet::new(),
+            HashSet::from(["<S>"]),
+            HashSet::from(["<S>", "<T>"]),
+        ];
         for text in [
-            "", "  's", "\t 's", "a  ", "é \u{3000}'re😀", "  <S>'s", "\t <S>  's<T> ",
-            "<S><T>", "<S> \u{2003}<T>", "  <S>  ", "x<T> <S>'s<T>",
+            "",
+            "  's",
+            "\t 's",
+            "a  ",
+            "é \u{3000}'re😀",
+            "  <S>'s",
+            "\t <S>  's<T> ",
+            "<S><T>",
+            "<S> \u{2003}<T>",
+            "  <S>  ",
+            "x<T> <S>'s<T>",
         ] {
-            assert_eq!(candidate.encode_ordinary(text), original.encode_ordinary(text), "{text:?}");
+            assert_eq!(
+                candidate.encode_ordinary(text),
+                original.encode_ordinary(text),
+                "{text:?}"
+            );
             for allowed in &allowed_sets {
-                assert_eq!(candidate.encode(text, allowed).unwrap(), original.encode(text, allowed).unwrap(), "{text:?}, {allowed:?}");
+                assert_eq!(
+                    candidate.encode(text, allowed).unwrap(),
+                    original.encode(text, allowed).unwrap(),
+                    "{text:?}, {allowed:?}"
+                );
             }
         }
     }
@@ -505,7 +663,10 @@ mod tests {
         // An unanchored iterator would skip the gap and return a second "a".
         // The admitted pattern has no gaps; this isolates anchoring itself.
         let simple = build_regular_regex("a").unwrap();
-        assert_eq!(RegularPieces::new(&simple, "a a").collect::<Vec<_>>(), ["a"]);
+        assert_eq!(
+            RegularPieces::new(&simple, "a a").collect::<Vec<_>>(),
+            ["a"]
+        );
     }
 
     #[test]
@@ -521,10 +682,23 @@ mod tests {
     fn forward_caches_survive_nested_early_close_and_concurrent_use() {
         let (_, regular) = matchers();
         let regular = Arc::new(regular);
-        let texts = ["", "aa11!!bb  's\u{3000}\u{a0}é  ", "\t 's", "é中文😀\0", " a  "];
+        let texts = [
+            "",
+            "aa11!!bb  's\u{3000}\u{a0}é  ",
+            "\t 's",
+            "é中文😀\0",
+            " a  ",
+        ];
         let original = fancy_regex::Regex::new(GUARDED_PATTERN).unwrap();
-        let expected: Vec<Vec<String>> = texts.iter().map(|text| original.find_iter(text)
-            .map(|m| m.unwrap().as_str().to_owned()).collect()).collect();
+        let expected: Vec<Vec<String>> = texts
+            .iter()
+            .map(|text| {
+                original
+                    .find_iter(text)
+                    .map(|m| m.unwrap().as_str().to_owned())
+                    .collect()
+            })
+            .collect();
         let clone = regular.as_ref().clone();
         assert!(Arc::ptr_eq(&regular.dfa, &clone.dfa));
         // Keep one pooled cache checked out while another iterator comes and goes.
@@ -534,20 +708,30 @@ mod tests {
         assert_eq!(early.next(), Some("\t"));
         drop(early);
         for (text, wanted) in texts.iter().zip(&expected) {
-            assert_eq!(RegularPieces::new(&clone, text).collect::<Vec<_>>(), *wanted);
+            assert_eq!(
+                RegularPieces::new(&clone, text).collect::<Vec<_>>(),
+                *wanted
+            );
         }
-        let handles: Vec<_> = (0..16).map(|_| {
-            let regular = Arc::clone(&regular);
-            let expected = expected.clone();
-            std::thread::spawn(move || {
-                for _ in 0..64 {
-                    for (text, wanted) in texts.iter().zip(&expected) {
-                        assert_eq!(RegularPieces::new(&regular, text).collect::<Vec<_>>(), *wanted);
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let regular = Arc::clone(&regular);
+                let expected = expected.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..64 {
+                        for (text, wanted) in texts.iter().zip(&expected) {
+                            assert_eq!(
+                                RegularPieces::new(&regular, text).collect::<Vec<_>>(),
+                                *wanted
+                            );
+                        }
                     }
-                }
+                })
             })
-        }).collect();
-        for handle in handles { handle.join().unwrap(); }
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
         let tail: String = held.collect();
         assert_eq!(format!("aa{tail}"), texts[1]);
         let joined = texts.join("");
@@ -607,6 +791,4 @@ mod tests {
             );
         }
     }
-
-
 }
