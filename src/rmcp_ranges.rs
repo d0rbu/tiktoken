@@ -3,7 +3,7 @@
 
 use std::collections::HashSet;
 
-use crate::{CoreBPE, EncodeError, _byte_pair_merge, byte_pair_encode_impl};
+use crate::{CoreBPE, EncodeError, _byte_pair_encode, _byte_pair_merge};
 
 impl CoreBPE {
     /// Visit the actual ordinary/special partitions, stopping when requested.
@@ -63,7 +63,7 @@ impl CoreBPE {
         } else if piece.len() > 1 && piece.len() < 100 {
             _byte_pair_merge(&self.encoder, piece).len() - 1
         } else {
-            byte_pair_encode_impl(piece, &self.encoder).len()
+            _byte_pair_encode(piece, &self.encoder).len()
         }
     }
 

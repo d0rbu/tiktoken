@@ -1,39 +1,17 @@
 use std::collections::HashSet;
 
 use pyo3::{
-    Borrowed, IntoPyObjectExt, PyResult, exceptions,
+    IntoPyObjectExt, PyResult, exceptions,
     prelude::*,
     pybacked::PyBackedStr,
-    types::{PyBytes, PyDict, PyList},
+    types::{PyBytes, PyList},
 };
 use rustc_hash::FxHashMap as HashMap;
-use smallvec::SmallVec;
 
 use crate::rmcp_source::{Batch as SourceBatch, Cursor as SourceCursor, ReadError};
 use crate::rmcp_token_storage;
-use crate::{CoreBPE, Rank, byte_pair_encode_impl};
-
-// Match PyO3's HashMap extraction order, building the final key storage once.
-struct InlineVocabulary(HashMap<SmallVec<[u8; 16]>, Rank>);
-
-impl<'py> FromPyObject<'_, 'py> for InlineVocabulary {
-    type Error = PyErr;
-
-    fn extract(ob: Borrowed<'_, 'py, PyAny>) -> PyResult<Self> {
-        let dict = ob.cast::<PyDict>()?;
-        let mut encoder = HashMap::with_capacity_and_hasher(dict.len(), Default::default());
-        for (key, value) in dict.iter() {
-            let bytes = if key.is_exact_instance_of::<PyBytes>() {
-                SmallVec::from_slice(key.cast::<PyBytes>()?.as_bytes())
-            } else {
-                SmallVec::from_vec(key.extract::<Vec<u8>>()?)
-            };
-            let rank = value.extract::<Rank>()?;
-            encoder.insert(bytes, rank);
-        }
-        Ok(Self(encoder))
-    }
-}
+use crate::rmcp_token_tier;
+use crate::{CoreBPE, Rank, _byte_pair_encode};
 
 fn storage_width(width: u8) -> PyResult<u8> {
     match width {
@@ -72,6 +50,149 @@ impl TokenStorageEncoder {
 #[pyclass(name = "_TokenStorageDecoder", frozen)]
 struct TokenStorageDecoder {
     width: u8,
+}
+
+#[pyclass(name = "_TokenTierCodec", frozen)]
+struct TokenTierCodec {
+    codec: rmcp_token_tier::Codec,
+}
+
+#[pymethods]
+impl TokenTierCodec {
+    #[new]
+    fn new(order: Vec<u32>, a: u8, b: u8) -> PyResult<Self> {
+        let codec = rmcp_token_tier::Codec::new(&order, a, b).ok_or_else(|| {
+            exceptions::PyValueError::new_err("invalid common-token tier codebook")
+        })?;
+        Ok(Self { codec })
+    }
+
+    fn encode(&self, py: Python<'_>, raw: &Bound<'_, PyBytes>) -> PyResult<Py<PyBytes>> {
+        let raw = raw.as_bytes();
+        let encoded = py
+            .detach(|| self.codec.encode(raw))
+            .ok_or_else(|| exceptions::PyValueError::new_err("invalid uint32 token block"))?;
+        Ok(PyBytes::new(py, &encoded).unbind())
+    }
+
+    fn decode(
+        &self,
+        py: Python<'_>,
+        data: &Bound<'_, PyBytes>,
+        count: usize,
+    ) -> PyResult<Py<PyAny>> {
+        let data = data.as_bytes();
+        let decoded = py
+            .detach(|| self.codec.decode(data, count))
+            .ok_or_else(|| {
+                exceptions::PyValueError::new_err("invalid prefix block extent or padding")
+            })?;
+        TiktokenBuffer::new(decoded).into_py_any(py)
+    }
+    fn encode_indexed(
+        &self,
+        py: Python<'_>,
+        raw: &Bound<'_, PyBytes>,
+    ) -> PyResult<(Py<PyBytes>, Py<PyBytes>)> {
+        let raw = raw.as_bytes();
+        let (data, checkpoints) = py
+            .detach(|| self.codec.encode_indexed(raw))
+            .ok_or_else(|| exceptions::PyValueError::new_err("invalid uint32 token block"))?;
+        Ok((
+            PyBytes::new(py, &data).unbind(),
+            PyBytes::new(py, &checkpoints).unbind(),
+        ))
+    }
+
+    fn decode_range(
+        &self,
+        py: Python<'_>,
+        data: &Bound<'_, PyBytes>,
+        checkpoints: &Bound<'_, PyBytes>,
+        tokens: usize,
+        start: usize,
+        count: usize,
+    ) -> PyResult<Py<PyAny>> {
+        let data = data.as_bytes();
+        let checkpoints = checkpoints.as_bytes();
+        let decoded = py
+            .detach(|| {
+                self.codec
+                    .decode_range(data, checkpoints, tokens, start, count)
+            })
+            .ok_or_else(|| exceptions::PyValueError::new_err("invalid indexed token range"))?;
+        TiktokenBuffer::new(decoded).into_py_any(py)
+    }
+
+    fn decode_ranges(
+        &self,
+        py: Python<'_>,
+        ranges: Vec<(Py<PyBytes>, Py<PyBytes>, usize, usize, usize)>,
+    ) -> PyResult<Py<PyAny>> {
+        let borrowed: Vec<_> = ranges
+            .iter()
+            .map(
+                |(data, checkpoints, tokens, start, count)| rmcp_token_tier::IndexedRange {
+                    data: data.bind(py).as_bytes(),
+                    checkpoints: checkpoints.bind(py).as_bytes(),
+                    tokens: *tokens,
+                    start: *start,
+                    count: *count,
+                },
+            )
+            .collect();
+        let decoded = py
+            .detach(|| self.codec.decode_ranges(&borrowed))
+            .ok_or_else(|| exceptions::PyValueError::new_err("invalid indexed token range"))?;
+        TiktokenBuffer::new(decoded).into_py_any(py)
+    }
+
+    fn encode_blocks(
+        &self,
+        py: Python<'_>,
+        raw: &Bound<'_, PyBytes>,
+        block_tokens: usize,
+    ) -> PyResult<Vec<(Py<PyBytes>, Py<PyBytes>)>> {
+        if block_tokens == 0 || block_tokens.checked_mul(4).is_none() {
+            return Err(exceptions::PyValueError::new_err(
+                "invalid token block size",
+            ));
+        }
+        let raw = raw.as_bytes();
+        let blocks = py
+            .detach(|| self.codec.encode_blocks(raw, block_tokens))
+            .ok_or_else(|| exceptions::PyValueError::new_err("invalid uint32 token block"))?;
+        Ok(blocks
+            .into_iter()
+            .map(|(data, positions)| {
+                (
+                    PyBytes::new(py, &data).unbind(),
+                    PyBytes::new(py, &positions).unbind(),
+                )
+            })
+            .collect())
+    }
+
+    fn encode_frame(
+        &self,
+        py: Python<'_>,
+        raw: &Bound<'_, PyBytes>,
+        block_tokens: usize,
+    ) -> PyResult<(Py<PyBytes>, Py<PyBytes>)> {
+        if block_tokens == 0 || block_tokens.checked_mul(4).is_none() {
+            return Err(exceptions::PyValueError::new_err(
+                "invalid token block size",
+            ));
+        }
+        let raw = raw.as_bytes();
+        let (data, entries) = py
+            .detach(|| self.codec.encode_frame(raw, block_tokens))
+            .ok_or_else(|| exceptions::PyValueError::new_err("invalid uint32 token block"))?;
+        Ok((
+            PyBytes::new(py, &data).unbind(),
+            PyBytes::new(py, &entries).unbind(),
+        ))
+    }
 }
 
 #[pymethods]
@@ -211,11 +332,11 @@ impl CoreBPE {
 
     #[new]
     fn py_new(
-        encoder: InlineVocabulary,
+        encoder: HashMap<Vec<u8>, Rank>,
         special_tokens_encoder: HashMap<String, Rank>,
         pattern: &str,
     ) -> PyResult<Self> {
-        Self::new_inline_internal(encoder.0, special_tokens_encoder, pattern)
+        Self::new_internal(encoder, special_tokens_encoder, pattern)
             .map_err(|e| PyErr::new::<exceptions::PyValueError, _>(e.to_string()))
     }
 
@@ -363,10 +484,11 @@ impl CoreBPE {
                     }
 
                     if !unstable_bytes.is_empty() {
-                        match self.encoder.get(unstable_bytes.as_slice()) {
+                        match self.encoder.get(&unstable_bytes) {
                             Some(token) => tokens.push(*token),
-                            None => tokens
-                                .extend(&byte_pair_encode_impl(&unstable_bytes, &self.encoder)),
+                            None => {
+                                tokens.extend(&_byte_pair_encode(&unstable_bytes, &self.encoder))
+                            }
                         }
                     }
                     tokens
@@ -407,7 +529,7 @@ impl CoreBPE {
         if let Some(token) = self.encoder.get(piece) {
             return vec![*token];
         }
-        byte_pair_encode_impl(piece, &self.encoder)
+        _byte_pair_encode(piece, &self.encoder)
     }
 
     // ====================
@@ -523,9 +645,11 @@ fn _prepare_utf8(_texts: Vec<PyBackedStr>) {}
 
 #[pymodule(gil_used = false)]
 fn _tiktoken(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
+
     m.add_class::<CoreBPE>()?;
     m.add_class::<TokenStorageEncoder>()?;
     m.add_class::<TokenStorageDecoder>()?;
+    m.add_class::<TokenTierCodec>()?;
     m.add_function(wrap_pyfunction!(_prepare_utf8, m)?)?;
     m.add_function(wrap_pyfunction!(crate::rmcp_token_bits::_unpack_bits17_into, m)?)?;
     Ok(())

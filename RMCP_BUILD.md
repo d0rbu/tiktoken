@@ -221,3 +221,48 @@ This is an experimental native implementation. A segmentation component result
 does not qualify complete token output, packing throughput or delivery. Native
 API controls, exact full-cache parity, complete-command comparison against the
 current pinned implementation and the final RMCP gate remain required.
+
+## Indexed tier frames
+
+The private `_TokenTierCodec` uses an immutable caller-supplied frequent-token
+order and emits independent indexed blocks. `encode_frame` concatenates each
+block's encoded bytes and sparse bit positions, with a separate little-endian
+(cumulative tokens, payload end, block end) table. It releases the GIL over
+immutable input bytes and returns owned byte strings. `decode_range` reads the
+requested token range from one indexed block. The RMCP caller bounds a frame to
+64 blocks and owns document accounting, physical shards and publication.
+
+Native controls compare every original17-bit ID, independently constructed bit
+codes and positions, partial blocks, invalid inputs, immutable ownership and
+concurrent codec use. The corresponding real-corpus RMCP comparison measured
+1.375901x whole-command throughput with1.29% additional CPU and byte-exact
+logical output. This measures the combined native/caller format path; it is not
+an isolated native speedup or a500B-token run. Final dependency-pinned RMCP
+qualification remains separate.
+
+
+## Bounded tier range batches (`0.14.0+rmcp.61.dev0`)
+
+The private `_TokenTierCodec.decode_ranges` accepts ordered immutable block
+bytes, sparse positions and token ranges. It appends the existing scalar decoder's
+results into one owned buffer under one detached native call. It preserves
+requested order and repeated ranges, and returns no partial result on failure.
+Encoding, stored bytes, codebook and scalar decoding are unchanged. The caller
+limits each batch to 64 block ranges and flushes before opening a new shard;
+single-fragment reads continue through the scalar method.
+
+Native controls passed 58 Rust and 411 Python cases. The paired RMCP caller
+passed 46 tier/conditioning controls, including error precedence and the batch
+bound. Twelve alternating comparisons of three real shuffled CPU updates
+(3,066,853 input IDs per pass, eight passes per arm) measured 1.092573x CPU
+microbatch construction throughput, bootstrap 95% interval 1.067117–1.129980.
+Wall time candidate/baseline was 0.915181. Returned tensors, labels and document
+metadata matched exactly. This includes CPU tensor allocation and filling,
+not GPU execution or full training. It does not change the previously recorded
+500B-token producer estimate. Final dependency-pinned RMCP qualification is
+required before adoption.
+
+An earlier unconditional batching screen regressed bulk reads beyond its fixed
+limit and was rejected. The accepted caller only batches multiple fragments.
+The unchanged scalar API remains available; no input-validation scans, hashes,
+background tasks or persistent caches are added.
