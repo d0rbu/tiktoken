@@ -129,12 +129,13 @@ fn ascii_alphanumeric_run<const LETTERS: bool>(bytes: &[u8]) -> usize {
     #[cfg(target_arch = "x86_64")]
     {
         use std::arch::x86_64::{
-            __m128i, _mm_and_si128, _mm_cmpgt_epi8, _mm_loadu_si128, _mm_movemask_epi8,
+            __m128i, _mm_add_epi8, _mm_cmpgt_epi8, _mm_loadu_si128, _mm_movemask_epi8,
             _mm_or_si128, _mm_set1_epi8,
         };
         while bytes.len() - end >= 16 {
             // SSE2 is baseline on x86-64. The length check bounds all 16 bytes;
-            // high-bit bytes fail the signed lower-bound comparison.
+            // Bias the accepted range to the top of the signed-positive bytes.
+            // Every other byte wraps below the threshold or into the negative half.
             let mask = unsafe {
                 let raw = _mm_loadu_si128(bytes.as_ptr().add(end).cast::<__m128i>());
                 let values = if LETTERS {
@@ -142,12 +143,9 @@ fn ascii_alphanumeric_run<const LETTERS: bool>(bytes: &[u8]) -> usize {
                 } else {
                     raw
                 };
-                let low = _mm_set1_epi8(if LETTERS { 96 } else { 47 });
-                let high = _mm_set1_epi8(if LETTERS { 123 } else { 58 });
-                _mm_movemask_epi8(_mm_and_si128(
-                    _mm_cmpgt_epi8(values, low),
-                    _mm_cmpgt_epi8(high, values),
-                )) as u32
+                let bias = _mm_set1_epi8(if LETTERS { 5 } else { 70 });
+                let threshold = _mm_set1_epi8(if LETTERS { 101 } else { 117 });
+                _mm_movemask_epi8(_mm_cmpgt_epi8(_mm_add_epi8(values, bias), threshold)) as u32
             };
             let boundary = (!mask) & 0xffff;
             if boundary != 0 {
@@ -344,6 +342,25 @@ mod tests {
     use crate::{CoreBPE, HashMap, Rank};
 
     const GUARDED_WHITESPACE: &str = r"\x{9}-\x{d}\x{20}\x{85}\x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}-\x{2029}\x{202f}\x{205f}\x{3000}";
+
+    #[test]
+    fn vector_ranges_match_every_byte_at_every_lane() {
+        for byte in 0..=255_u8 {
+            for position in 0..48 {
+                let mut letters = [b'a'; 48];
+                letters[position] = byte;
+                let expected = letters
+                    .iter()
+                    .take_while(|b| b.is_ascii_alphabetic())
+                    .count();
+                assert_eq!(super::ascii_alphanumeric_run::<true>(&letters), expected);
+                let mut digits = [b'4'; 48];
+                digits[position] = byte;
+                let expected = digits.iter().take_while(|b| b.is_ascii_digit()).count();
+                assert_eq!(super::ascii_alphanumeric_run::<false>(&digits), expected);
+            }
+        }
+    }
 
     #[test]
     fn vector_runs_preserve_boundaries_and_unicode_fallback() {
