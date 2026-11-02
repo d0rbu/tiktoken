@@ -8,6 +8,14 @@ pub(crate) struct Codec {
     bases: [usize; 4],
 }
 
+pub(crate) struct IndexedRange<'a> {
+    pub(crate) data: &'a [u8],
+    pub(crate) checkpoints: &'a [u8],
+    pub(crate) tokens: usize,
+    pub(crate) start: usize,
+    pub(crate) count: usize,
+}
+
 impl Codec {
     pub(crate) fn new(order: &[u32], a: u8, b: u8) -> Option<Self> {
         if !(1..=8).contains(&a) || b <= a || b > 14 {
@@ -169,7 +177,7 @@ impl Codec {
     }
 
     pub(crate) fn decode(&self, data: &[u8], count: usize) -> Option<Vec<u32>> {
-        self.decode_at(data, count, 0, 0, true)
+        self.decode_at(data, count, 0, 0, true, Vec::new())
     }
 
     pub(crate) fn decode_range(
@@ -180,12 +188,38 @@ impl Codec {
         start: usize,
         count: usize,
     ) -> Option<Vec<u32>> {
+        self.append_range(
+            &IndexedRange {
+                data,
+                checkpoints,
+                tokens,
+                start,
+                count,
+            },
+            Vec::new(),
+        )
+    }
+
+    pub(crate) fn decode_ranges(&self, ranges: &[IndexedRange<'_>]) -> Option<Vec<u32>> {
+        ranges
+            .iter()
+            .try_fold(Vec::new(), |output, range| self.append_range(range, output))
+    }
+
+    fn append_range(&self, range: &IndexedRange<'_>, output: Vec<u32>) -> Option<Vec<u32>> {
+        let IndexedRange {
+            data,
+            checkpoints,
+            tokens,
+            start,
+            count,
+        } = *range;
         let end = start.checked_add(count)?;
         if end > tokens {
             return None;
         }
         if count == 0 {
-            return Some(Vec::new());
+            return Some(output);
         }
         let begin = (start / 256).checked_mul(4)?;
         let position = u32::from_le_bytes(
@@ -194,7 +228,7 @@ impl Codec {
                 .try_into()
                 .ok()?,
         ) as usize;
-        self.decode_at(data, count, position, start % 256, end == tokens)
+        self.decode_at(data, count, position, start % 256, end == tokens, output)
     }
 
     fn decode_at(
@@ -204,13 +238,14 @@ impl Codec {
         mut position: usize,
         skip: usize,
         exact_end: bool,
+        mut output: Vec<u32>,
     ) -> Option<Vec<u32>> {
         let total_bits = data.len().checked_mul(8)?;
         let steps = count.checked_add(skip)?;
         if steps > total_bits.checked_sub(position)? / self.widths[0] {
             return None;
         }
-        let mut output = Vec::with_capacity(count);
+        output.reserve(count);
         for step in 0..steps {
             let begin = position / 8;
             let word = if data.len() - begin >= 4 {
@@ -476,6 +511,37 @@ mod tests {
         );
         assert_eq!(codec.encode_indexed(&[]), Some((vec![], vec![])));
         assert_eq!(codec.decode_range(&[], &[], 0, 0, 0), Some(vec![]));
+    }
+
+    #[test]
+    fn grouped_ranges_preserve_order_and_discard_partial_results_on_error() {
+        let codec = Codec::new(&(0..1056).collect::<Vec<_>>(), 5, 10).unwrap();
+        let ids: Vec<_> = (0..8193).map(|i| (i * 503) % 131072).collect();
+        let (data, checkpoints) = codec.encode_indexed(&raw(&ids)).unwrap();
+        let mut ranges: Vec<_> = [(255, 1024), (0, 0), (8192, 1), (0, 256)]
+            .into_iter()
+            .map(|(start, count)| IndexedRange {
+                data: &data,
+                checkpoints: &checkpoints,
+                tokens: ids.len(),
+                start,
+                count,
+            })
+            .collect();
+        let expected: Vec<_> = ranges
+            .iter()
+            .flat_map(|r| ids[r.start..r.start + r.count].iter().copied())
+            .collect();
+        assert_eq!(codec.decode_ranges(&ranges), Some(expected));
+        assert_eq!(codec.decode_ranges(&[]), Some(vec![]));
+        ranges.push(IndexedRange {
+            data: &data,
+            checkpoints: &checkpoints,
+            tokens: ids.len(),
+            start: usize::MAX,
+            count: 2,
+        });
+        assert!(codec.decode_ranges(&ranges).is_none());
     }
 
     #[test]

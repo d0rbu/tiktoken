@@ -124,6 +124,29 @@ impl TokenTierCodec {
         TiktokenBuffer::new(decoded).into_py_any(py)
     }
 
+    fn decode_ranges(
+        &self,
+        py: Python<'_>,
+        ranges: Vec<(Py<PyBytes>, Py<PyBytes>, usize, usize, usize)>,
+    ) -> PyResult<Py<PyAny>> {
+        let borrowed: Vec<_> = ranges
+            .iter()
+            .map(
+                |(data, checkpoints, tokens, start, count)| rmcp_token_tier::IndexedRange {
+                    data: data.bind(py).as_bytes(),
+                    checkpoints: checkpoints.bind(py).as_bytes(),
+                    tokens: *tokens,
+                    start: *start,
+                    count: *count,
+                },
+            )
+            .collect();
+        let decoded = py
+            .detach(|| self.codec.decode_ranges(&borrowed))
+            .ok_or_else(|| exceptions::PyValueError::new_err("invalid indexed token range"))?;
+        TiktokenBuffer::new(decoded).into_py_any(py)
+    }
+
     fn encode_blocks(
         &self,
         py: Python<'_>,
