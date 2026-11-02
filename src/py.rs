@@ -645,6 +645,7 @@ fn _prepare_utf8(_texts: Vec<PyBackedStr>) {}
 
 #[pymodule(gil_used = false)]
 fn _tiktoken(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
+
     m.add_class::<CoreBPE>()?;
     m.add_class::<TokenStorageEncoder>()?;
     m.add_class::<TokenStorageDecoder>()?;

@@ -202,6 +202,7 @@ where
 {
     type Item = Result<&'t str, fancy_regex::Error>;
 
+    #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         match self {
             Self::Original(original) => original.next(),
@@ -231,6 +232,7 @@ impl<'r, 't> RegularPieces<'r, 't> {
 impl<'t> Iterator for RegularPieces<'_, 't> {
     type Item = &'t str;
 
+    #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         let start = self.input.start();
         if start == self.text.len() {
@@ -241,6 +243,14 @@ impl<'t> Iterator for RegularPieces<'_, 't> {
             self.input.set_start(end);
             return Some(&self.text[start..end]);
         }
+        self.next_unicode(start)
+    }
+}
+
+impl<'t> RegularPieces<'_, 't> {
+    // Keep the complete DFA/error/whitespace path outside the common ASCII loop.
+    #[inline(never)]
+    fn next_unicode(&mut self, start: usize) -> Option<&'t str> {
         // No quit bytes, word boundaries, or cache give-up limits are enabled;
         // this exact nonempty pattern covers each scalar at the anchored start.
         let matched = match_state_search(&self.regex.dfa, &mut self.cache, &self.text[start..])
