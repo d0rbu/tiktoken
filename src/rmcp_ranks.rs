@@ -39,6 +39,7 @@ fn short_key(bytes: &[u8]) -> u64 {
     word | ((bytes.len() as u64) << 56)
 }
 
+#[repr(C)]
 #[derive(Clone, Copy, Eq, Hash)]
 struct MediumKey {
     first: u64,
@@ -48,8 +49,22 @@ struct MediumKey {
 impl PartialEq for MediumKey {
     #[inline(always)]
     fn eq(&self, other: &Self) -> bool {
-        // Check both words without a first-word short-circuit branch.
-        ((self.first ^ other.first) | (self.tail ^ other.tail)) == 0
+        #[cfg(target_arch = "x86_64")]
+        {
+            use std::arch::x86_64::{_mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
+
+            // SSE2 is baseline on x86_64. repr(C) with two u64 fields provides
+            // exactly 16 initialized bytes; loadu does not require 16-byte alignment.
+            unsafe {
+                let left = _mm_loadu_si128(std::ptr::from_ref(self).cast());
+                let right = _mm_loadu_si128(std::ptr::from_ref(other).cast());
+                _mm_movemask_epi8(_mm_cmpeq_epi8(left, right)) == 0xffff
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            self.first == other.first && self.tail == other.tail
+        }
     }
 }
 
