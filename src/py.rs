@@ -11,7 +11,28 @@ use rustc_hash::FxHashMap as HashMap;
 use crate::rmcp_source::{Batch as SourceBatch, Cursor as SourceCursor, ReadError};
 use crate::rmcp_token_storage;
 use crate::rmcp_token_tier;
-use crate::{CoreBPE, Rank, _byte_pair_encode};
+use crate::{_byte_pair_encode, CoreBPE, Rank};
+
+fn packed_ranks(mut raw: &[u8]) -> PyResult<HashMap<Vec<u8>, Rank>> {
+    let mut ranks = HashMap::default();
+    while !raw.is_empty() {
+        let header = raw
+            .get(..8)
+            .ok_or_else(|| exceptions::PyValueError::new_err("truncated packed rank header"))?;
+        let rank = u32::from_le_bytes(header[..4].try_into().unwrap());
+        let size = u32::from_le_bytes(header[4..].try_into().unwrap()) as usize;
+        raw = &raw[8..];
+        let word = raw
+            .get(..size)
+            .ok_or_else(|| exceptions::PyValueError::new_err("truncated packed rank word"))?;
+        ranks.insert(word.to_vec(), rank);
+        raw = &raw[size..];
+    }
+    if ranks.is_empty() {
+        return Err(exceptions::PyValueError::new_err("empty packed ranks"));
+    }
+    Ok(ranks)
+}
 
 fn storage_width(width: u8) -> PyResult<u8> {
     match width {
@@ -340,6 +361,32 @@ impl CoreBPE {
             .map_err(|e| PyErr::new::<exceptions::PyValueError, _>(e.to_string()))
     }
 
+    #[staticmethod]
+    fn _from_packed_ranks(
+        ranks: &Bound<'_, PyBytes>,
+        special_tokens: HashMap<String, Rank>,
+        pattern: &str,
+    ) -> PyResult<(Self, Rank)> {
+        let encoder = packed_ranks(ranks.as_bytes())?;
+        let maximum = encoder
+            .values()
+            .chain(special_tokens.values())
+            .copied()
+            .max()
+            .unwrap();
+        let core = Self::new_internal(encoder, special_tokens, pattern)
+            .map_err(|e| PyErr::new::<exceptions::PyValueError, _>(e.to_string()))?;
+        Ok((core, maximum))
+    }
+
+    fn _mergeable_ranks(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let ranks = pyo3::types::PyDict::new(py);
+        for (rank, word) in &self.decoder {
+            ranks.set_item(PyBytes::new(py, word), rank)?;
+        }
+        Ok(ranks.into_any().unbind())
+    }
+
     // ====================
     // Encoding
     // ====================
@@ -645,17 +692,22 @@ fn _prepare_utf8(_texts: Vec<PyBackedStr>) {}
 
 #[pymodule(gil_used = false)]
 fn _tiktoken(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(crate::rmcp_model::_bounded_model_vocab, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        crate::rmcp_model::_bounded_model_vocab,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(crate::rmcp_model::_prove_model_words, m)?)?;
     m.add_function(wrap_pyfunction!(crate::rmcp_model::_model_word_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(crate::rmcp_model::_admit_model_words, m)?)?;
-
 
     m.add_class::<CoreBPE>()?;
     m.add_class::<TokenStorageEncoder>()?;
     m.add_class::<TokenStorageDecoder>()?;
     m.add_class::<TokenTierCodec>()?;
     m.add_function(wrap_pyfunction!(_prepare_utf8, m)?)?;
-    m.add_function(wrap_pyfunction!(crate::rmcp_token_bits::_unpack_bits17_into, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        crate::rmcp_token_bits::_unpack_bits17_into,
+        m
+    )?)?;
     Ok(())
 }
