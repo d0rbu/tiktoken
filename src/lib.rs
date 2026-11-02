@@ -16,6 +16,8 @@ mod rmcp_ranks;
 use rmcp_ranks::{EncoderRanks, RankLookup};
 #[cfg(any(feature = "python", test))]
 mod rmcp_source;
+#[cfg(any(feature = "python", test))]
+mod rmcp_token_tier;
 #[cfg(feature = "python")]
 mod rmcp_token_bits;
 #[cfg(any(feature = "python", test))]

@@ -221,3 +221,21 @@ This is an experimental native implementation. A segmentation component result
 does not qualify complete token output, packing throughput or delivery. Native
 API controls, exact full-cache parity, complete-command comparison against the
 current pinned implementation and the final RMCP gate remain required.
+
+## Indexed tier frames
+
+The private `_TokenTierCodec` uses an immutable caller-supplied frequent-token
+order and emits independent indexed blocks. `encode_frame` concatenates each
+block's encoded bytes and sparse bit positions, with a separate little-endian
+(cumulative tokens, payload end, block end) table. It releases the GIL over
+immutable input bytes and returns owned byte strings. `decode_range` reads the
+requested token range from one indexed block. The RMCP caller bounds a frame to
+64 blocks and owns document accounting, physical shards and publication.
+
+Native controls compare every original17-bit ID, independently constructed bit
+codes and positions, partial blocks, invalid inputs, immutable ownership and
+concurrent codec use. The corresponding real-corpus RMCP comparison measured
+1.375901x whole-command throughput with1.29% additional CPU and byte-exact
+logical output. This measures the combined native/caller format path; it is not
+an isolated native speedup or a500B-token run. Final dependency-pinned RMCP
+qualification remains separate.
