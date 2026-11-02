@@ -266,3 +266,7 @@ An earlier unconditional batching screen regressed bulk reads beyond its fixed
 limit and was rejected. The accepted caller only batches multiple fragments.
 The unchanged scalar API remains available; no input-validation scans, hashes,
 background tasks or persistent caches are added.
+
+## Private model admission
+
+The RMCP-only model helpers retain the existing ordered vocabulary, merge, byte-alphabet, and proof-quota rules while running their loops in the extension. Public encoding and generic callback behavior stay the same. `tests/test_rmcp_model.py` exercises rejection, callback ordering, quotas, and byte conversion.

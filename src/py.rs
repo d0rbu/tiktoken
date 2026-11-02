@@ -645,6 +645,11 @@ fn _prepare_utf8(_texts: Vec<PyBackedStr>) {}
 
 #[pymodule(gil_used = false)]
 fn _tiktoken(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(crate::rmcp_model::_bounded_model_vocab, m)?)?;
+    m.add_function(wrap_pyfunction!(crate::rmcp_model::_prove_model_words, m)?)?;
+    m.add_function(wrap_pyfunction!(crate::rmcp_model::_model_word_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(crate::rmcp_model::_admit_model_words, m)?)?;
+
 
     m.add_class::<CoreBPE>()?;
     m.add_class::<TokenStorageEncoder>()?;
