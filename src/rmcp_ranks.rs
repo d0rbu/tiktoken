@@ -1,3 +1,4 @@
+use std::hash::{BuildHasher, BuildHasherDefault};
 use std::ops::Index;
 
 use rustc_hash::FxHashMap as HashMap;
@@ -97,9 +98,77 @@ impl MediumKey {
     }
 }
 
+// Packed short keys have a length tag of at most seven, so this cannot be a key.
+const EMPTY_SHORT_KEY: u64 = u64::MAX;
+
+#[derive(Clone, Copy)]
+struct ShortSlot {
+    key: u64,
+    rank: Rank,
+}
+
+#[derive(Clone)]
+struct ShortRanks {
+    primary: Vec<ShortSlot>,
+    overflow: HashMap<u64, Rank>,
+}
+
+impl ShortRanks {
+    fn with_capacity(count: usize) -> Self {
+        Self {
+            primary: vec![
+                ShortSlot {
+                    key: EMPTY_SHORT_KEY,
+                    rank: 0
+                };
+                count.max(1).next_power_of_two()
+            ],
+            overflow: HashMap::with_capacity_and_hasher(count / 4, Default::default()),
+        }
+    }
+
+    #[inline(always)]
+    fn bucket(&self, key: u64) -> usize {
+        let hash = BuildHasherDefault::<rustc_hash::FxHasher>::default().hash_one(key);
+        hash as usize & (self.primary.len() - 1)
+    }
+
+    fn insert(&mut self, key: u64, rank: Rank) {
+        let bucket = self.bucket(key);
+        let slot = &mut self.primary[bucket];
+        if slot.key == EMPTY_SHORT_KEY || slot.key == key {
+            *slot = ShortSlot { key, rank };
+        } else if rank < slot.rank {
+            self.overflow.insert(slot.key, slot.rank);
+            *slot = ShortSlot { key, rank };
+        } else {
+            self.overflow.insert(key, rank);
+        }
+    }
+
+    #[inline(always)]
+    fn get(&self, key: &u64) -> Option<&Rank> {
+        let slot = &self.primary[self.bucket(*key)];
+        if slot.key == *key {
+            Some(&slot.rank)
+        } else {
+            self.overflow.get(key)
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.primary
+            .iter()
+            .filter(|slot| slot.key != EMPTY_SHORT_KEY)
+            .count()
+            + self.overflow.len()
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct EncoderRanks {
-    short: HashMap<u64, Rank>,
+    short: ShortRanks,
     medium: HashMap<MediumKey, Rank>,
     long: HashMap<Vec<u8>, Rank>,
 }
@@ -114,12 +183,15 @@ impl From<HashMap<Vec<u8>, Rank>> for EncoderRanks {
                 _ => 2,
             }] += 1;
         }
-        let mut short = HashMap::with_capacity_and_hasher(counts[0], Default::default());
+        let mut short = ShortRanks::with_capacity(counts[0]);
         let mut medium = HashMap::with_capacity_and_hasher(counts[1], Default::default());
         let mut long = HashMap::with_capacity_and_hasher(counts[2], Default::default());
         for (bytes, rank) in ranks {
             match bytes.len() {
-                0..=7 => short.insert(short_key(&bytes), rank),
+                0..=7 => {
+                    short.insert(short_key(&bytes), rank);
+                    None
+                }
                 8..=15 => medium.insert(MediumKey::from_bytes(&bytes), rank),
                 _ => long.insert(bytes, rank),
             };
@@ -189,6 +261,40 @@ impl Index<&[u8]> for EncoderRanks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn primary_and_overflow_preserve_colliding_keys_max_ranks_and_clone() {
+        let mut short = ShortRanks::with_capacity(16);
+        let keys: Vec<u64> = (0..=10000)
+            .filter(|&key| short.bucket(key) == 0)
+            .take(32)
+            .collect();
+        assert_eq!(keys.len(), 32);
+        let mut reference = HashMap::default();
+        for (i, &key) in keys.iter().enumerate().rev() {
+            let rank = if i == 31 { Rank::MAX } else { i as Rank };
+            short.insert(key, rank);
+            reference.insert(key, rank);
+        }
+        assert_eq!(short.primary[0].key, keys[0]);
+        assert_eq!(short.overflow.len(), 31);
+        let cloned = short.clone();
+        for key in 0..=10000 {
+            assert_eq!(short.get(&key), reference.get(&key));
+            assert_eq!(cloned.get(&key), reference.get(&key));
+        }
+        for count in [0, 1, 2, 15, 16, 17, 63, 64, 65] {
+            let mut table = ShortRanks::with_capacity(count);
+            for key in 0..count as u64 {
+                table.insert(key, Rank::MAX);
+            }
+            assert_eq!(table.len(), count);
+            for key in 0..count as u64 {
+                assert_eq!(table.get(&key), Some(&Rank::MAX));
+            }
+            assert_eq!(table.get(&(count as u64)), None);
+        }
+    }
 
     #[test]
     fn parent_window_matches_all_short_lengths_and_end_alignments() {
