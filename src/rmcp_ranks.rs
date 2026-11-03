@@ -58,6 +58,30 @@ fn short_key_window(source: &[u8], start: usize, length: usize) -> u64 {
     ((word >> shift) & mask) | ((length as u64) << 56)
 }
 
+// Lengths through seven use their existing high-byte tag. A complete
+// eight-byte word is admitted only when its high byte is outside those tags.
+const SHORT_WINDOW_MASKS: [u64; 9] = [
+    0,
+    0xff,
+    0xffff,
+    0xffffff,
+    0xffffffff,
+    0xffffffffff,
+    0xffffffffffff,
+    0xffffffffffffff,
+    u64::MAX,
+];
+
+#[inline(always)]
+fn short_or_eight_key_window(source: &[u8], start: usize, length: usize) -> u64 {
+    let window = start.min(source.len() - 8);
+    let word = u64::from_le_bytes(source[window..window + 8].try_into().unwrap());
+    // Empty spans may start at EOF. Their zero mask removes the loaded word
+    // even when the defined wrapping shift is 64.
+    let word = word.wrapping_shr(((start - window) * 8) as u32);
+    (word & SHORT_WINDOW_MASKS[length]) | (((length & 7) as u64) << 56)
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Eq, Hash)]
 struct MediumKey {
@@ -110,6 +134,7 @@ impl From<HashMap<Vec<u8>, Rank>> for EncoderRanks {
         for bytes in ranks.keys() {
             counts[match bytes.len() {
                 0..=7 => 0,
+                8 if bytes[7] > 7 => 0,
                 8..=15 => 1,
                 _ => 2,
             }] += 1;
@@ -120,6 +145,9 @@ impl From<HashMap<Vec<u8>, Rank>> for EncoderRanks {
         for (bytes, rank) in ranks {
             match bytes.len() {
                 0..=7 => short.insert(short_key(&bytes), rank),
+                8 if bytes[7] > 7 => {
+                    short.insert(u64::from_le_bytes(bytes[..8].try_into().unwrap()), rank)
+                }
                 8..=15 => medium.insert(MediumKey::from_bytes(&bytes), rank),
                 _ => long.insert(bytes, rank),
             };
@@ -137,6 +165,9 @@ impl EncoderRanks {
     pub(crate) fn get(&self, bytes: &[u8]) -> Option<&Rank> {
         match bytes.len() {
             0..=7 => self.short.get(&short_key(bytes)),
+            8 if bytes[7] > 7 => self
+                .short
+                .get(&u64::from_le_bytes(bytes[..8].try_into().unwrap())),
             8..=15 => self.medium.get(&MediumKey::from_bytes(bytes)),
             _ => self.long.get(bytes),
         }
@@ -149,10 +180,22 @@ impl EncoderRanks {
             return self.get(bytes);
         }
         match bytes.len() {
-            0..=7 => self
-                .short
-                .get(&short_key_window(source, start, bytes.len())),
-            8..=15 => self.medium.get(&MediumKey {
+            0..=8 => {
+                let key = short_or_eight_key_window(source, start, bytes.len());
+                // For lengths 0..7 the added term is at least 64; for length
+                // eight it is zero. Only an eight-byte key ending in 0..7
+                // reaches the medium map. Combining the values avoids another
+                // unpredictable length branch in this shared query path.
+                if (key >> 56) + (((bytes.len() ^ 8) * 8) as u64) < 8 {
+                    self.medium.get(&MediumKey {
+                        first: key,
+                        tail: 0,
+                    })
+                } else {
+                    self.short.get(&key)
+                }
+            }
+            9..=15 => self.medium.get(&MediumKey {
                 first: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
                 tail: short_key_window(source, start + 8, bytes.len() - 8),
             }),
@@ -261,6 +304,52 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn eighth_byte_keys_are_disjoint_from_length_tags() {
+        let mut original = HashMap::default();
+        for len in 0..=7 {
+            for byte in 0..=255_u8 {
+                original.insert(vec![byte; len], original.len() as Rank);
+            }
+        }
+        for terminal in 0..=255_u8 {
+            for first in [0, 1, 7, 8, 127, 128, 255] {
+                let mut key = vec![0; 8];
+                key[0] = first;
+                key[7] = terminal;
+                original.insert(key, original.len() as Rank);
+            }
+        }
+        original.insert(vec![255; 8], Rank::MAX);
+        let expected_short = original
+            .keys()
+            .filter(|k| k.len() <= 7 || (k.len() == 8 && k[7] > 7))
+            .count();
+        let expected_medium = original.len() - expected_short;
+        let encoded = EncoderRanks::from(original.clone());
+        assert_eq!(encoded.short.len(), expected_short);
+        assert_eq!(encoded.medium.len(), expected_medium);
+        for (key, rank) in original {
+            assert_eq!(encoded.get(&key), Some(&rank));
+            for prefix in 0..=8 {
+                for suffix in 0..=8 {
+                    let mut parent = vec![255; prefix];
+                    parent.extend_from_slice(&key);
+                    parent.extend(vec![0; suffix]);
+                    assert_eq!(
+                        encoded.get_span(&parent, prefix, prefix + key.len()),
+                        Some(&rank)
+                    );
+                }
+            }
+        }
+        for terminal in 0..=255_u8 {
+            let mut key = vec![43; 8];
+            key[7] = terminal;
+            assert_eq!(encoded.get(&key), None);
         }
     }
 
