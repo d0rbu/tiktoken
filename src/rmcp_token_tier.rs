@@ -245,26 +245,27 @@ impl Codec {
         if steps > total_bits.checked_sub(position)? / self.widths[0] {
             return None;
         }
-        output.reserve(count);
-        for step in 0..steps {
-            let begin = position / 8;
-            let word = if data.len() - begin >= 4 {
-                u32::from_be_bytes(data[begin..begin + 4].try_into().unwrap())
-            } else {
-                let mut bytes = [0; 4];
-                bytes[..data.len() - begin].copy_from_slice(&data[begin..]);
-                u32::from_be_bytes(bytes)
-            } << (position % 8);
+        let begin = output.len();
+        output.resize(begin.checked_add(count)?, 0);
+        // Discard the bounded checkpoint prefix without touching the output.
+        for _ in 0..skip {
+            let tier = (word_at(data, position) >> 30) as usize;
+            position += self.widths[tier];
+            if position > total_bits {
+                return None;
+            }
+        }
+        // The exact output slice carries the range's extent through the loop.
+        for destination in &mut output[begin..] {
+            let word = word_at(data, position);
             let tier = (word >> 30) as usize;
             let width = self.widths[tier];
             let value = (word >> (32 - width)) & self.masks[tier];
-            if step >= skip {
-                output.push(if tier == 3 {
-                    value
-                } else {
-                    self.order[self.bases[tier] + value as usize]
-                });
-            }
+            *destination = if tier == 3 {
+                value
+            } else {
+                self.order[self.bases[tier] + value as usize]
+            };
             position += width;
             if position > total_bits {
                 return None;
@@ -279,6 +280,19 @@ impl Codec {
         }
         Some(output)
     }
+}
+
+#[inline]
+fn word_at(data: &[u8], position: usize) -> u32 {
+    let begin = position / 8;
+    let word = if data.len() - begin >= 4 {
+        u32::from_be_bytes(data[begin..begin + 4].try_into().unwrap())
+    } else {
+        let mut bytes = [0; 4];
+        bytes[..data.len() - begin].copy_from_slice(&data[begin..]);
+        u32::from_be_bytes(bytes)
+    };
+    word << (position % 8)
 }
 
 #[cfg(test)]
@@ -304,6 +318,75 @@ mod tests {
             bytes[i / 8] |= bit << (7 - i % 8);
         }
         bytes
+    }
+
+    #[test]
+    fn sized_ranges_match_original_values_at_every_checkpoint_offset() {
+        for (a, b) in [(1, 2), (5, 10), (8, 14)] {
+            let order: Vec<_> = (0..(1 << a) + (1 << b)).collect();
+            let codec = Codec::new(&order, a, b).unwrap();
+            let ids: Vec<u32> = (0..1793).map(|i| (i * 503) % 131072).collect();
+            let (data, checkpoints) = codec.encode_indexed(&raw(&ids)).unwrap();
+            for start in 0..512 {
+                let count = 777;
+                assert_eq!(
+                    codec.decode_range(&data, &checkpoints, ids.len(), start, count),
+                    Some(ids[start..start + count].to_vec())
+                );
+            }
+            let ranges = [(257, 511), (0, 1), (1793, 0), (1792, 1), (511, 777)];
+            let commands: Vec<_> = ranges
+                .iter()
+                .map(|&(start, count)| IndexedRange {
+                    data: &data,
+                    checkpoints: &checkpoints,
+                    tokens: ids.len(),
+                    start,
+                    count,
+                })
+                .collect();
+            let expected: Vec<_> = ranges
+                .iter()
+                .flat_map(|&(start, count)| ids[start..start + count].iter().copied())
+                .collect();
+            assert_eq!(codec.decode_ranges(&commands), Some(expected));
+        }
+    }
+
+    #[test]
+    fn sized_ranges_reject_truncation_in_prefix_and_output_and_bad_padding() {
+        let codec = Codec::new(&(0..1056).collect::<Vec<_>>(), 5, 10).unwrap();
+        let ids: Vec<u32> = (0..769).map(|i| (i * 503) % 131072).collect();
+        let (data, checkpoints) = codec.encode_indexed(&raw(&ids)).unwrap();
+        for end in [0, 1, data.len() / 2] {
+            assert!(
+                codec
+                    .decode_range(&data[..end], &checkpoints, ids.len(), 127, 600)
+                    .is_none()
+            );
+        }
+        let mut tail = data.clone();
+        tail.push(0);
+        assert!(
+            codec
+                .decode_range(&tail, &checkpoints, ids.len(), 255, 514)
+                .is_none()
+        );
+        let good = IndexedRange {
+            data: &data,
+            checkpoints: &checkpoints,
+            tokens: ids.len(),
+            start: 257,
+            count: 300,
+        };
+        let bad = IndexedRange {
+            data: &tail,
+            checkpoints: &checkpoints,
+            tokens: ids.len(),
+            start: 255,
+            count: 514,
+        };
+        assert!(codec.decode_ranges(&[good, bad]).is_none());
     }
 
     #[test]
