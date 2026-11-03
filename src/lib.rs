@@ -433,7 +433,7 @@ impl CoreBPE {
         text: &str,
         allowed_special: &HashSet<&str>,
     ) -> Result<(Vec<Rank>, usize), EncodeError> {
-        self.encode_with_count::<false>(text, allowed_special)
+        self.encode_dispatch::<false>(text, allowed_special)
             .map(|(tokens, last_piece, _)| (tokens, last_piece))
     }
 
@@ -443,10 +443,35 @@ impl CoreBPE {
         text: &str,
         allowed_special: &HashSet<&str>,
     ) -> Result<usize, EncodeError> {
-        self.encode_with_count::<true>(text, allowed_special)
+        self.encode_dispatch::<true>(text, allowed_special)
             .map(|(_, _, count)| count)
     }
 
+    #[inline]
+    fn encode_dispatch<const COUNT_ONLY: bool>(
+        &self,
+        text: &str,
+        allowed_special: &HashSet<&str>,
+    ) -> Result<(Vec<Rank>, usize, usize), EncodeError> {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if std::is_x86_feature_detected!("ssse3") {
+            // The baseline path remains available on CPUs without SSSE3.
+            return unsafe { self.encode_ssse3::<COUNT_ONLY>(text, allowed_special) };
+        }
+        self.encode_with_count::<COUNT_ONLY>(text, allowed_special)
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "ssse3")]
+    unsafe fn encode_ssse3<const COUNT_ONLY: bool>(
+        &self,
+        text: &str,
+        allowed_special: &HashSet<&str>,
+    ) -> Result<(Vec<Rank>, usize, usize), EncodeError> {
+        self.encode_with_count::<COUNT_ONLY>(text, allowed_special)
+    }
+
+    #[inline(always)]
     fn encode_with_count<const COUNT_ONLY: bool>(
         &self,
         text: &str,
@@ -962,6 +987,49 @@ mod owned_batch_tests {
                     expected.len()
                 );
                 assert_eq!(model.encode_ordinary(&text), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn ssse3_dispatch_matches_portable_tokens_counts_and_last_piece() {
+        let mut state = 71_u64;
+        for pattern in [include_str!("rmcp_pattern.txt"), r"[\s\S]+"] {
+            let model = core(pattern);
+            for size in 0..=160 {
+                let mut text = String::new();
+                for _ in 0..size {
+                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    text.push_str(
+                        ["a", "b", "c", " ", "é", "😀", "\0", "<S>", "<T>", "\n"]
+                            [(state >> 32) as usize % 10],
+                    );
+                }
+                for allowed in [HashSet::new(), HashSet::from(["<S>", "<T>"])] {
+                    let expected = model.encode_with_count::<false>(&text, &allowed).unwrap();
+                    assert_eq!(
+                        model.encode_dispatch::<false>(&text, &allowed).unwrap(),
+                        expected
+                    );
+                    let count = model.encode_with_count::<true>(&text, &allowed).unwrap();
+                    assert_eq!(
+                        model.encode_dispatch::<true>(&text, &allowed).unwrap(),
+                        count
+                    );
+                    assert_eq!(count.2, expected.0.len());
+                    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                    if std::is_x86_feature_detected!("ssse3") {
+                        // The same detection as the public dispatch guards this direct test.
+                        assert_eq!(
+                            unsafe { model.encode_ssse3::<false>(&text, &allowed) }.unwrap(),
+                            expected
+                        );
+                        assert_eq!(
+                            unsafe { model.encode_ssse3::<true>(&text, &allowed) }.unwrap(),
+                            count
+                        );
+                    }
+                }
             }
         }
     }
