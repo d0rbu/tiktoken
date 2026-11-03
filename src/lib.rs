@@ -452,6 +452,31 @@ impl CoreBPE {
         text: &str,
         allowed_special: &HashSet<&str>,
     ) -> Result<(Vec<Rank>, usize, usize), EncodeError> {
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("bmi2") {
+            // Dispatch once per document. The specialized body uses the same
+            // tables and algorithm; every other CPU keeps the portable body.
+            return unsafe { self.encode_with_features::<COUNT_ONLY>(text, allowed_special) };
+        }
+        self.encode_portable::<COUNT_ONLY>(text, allowed_special)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,bmi2")]
+    unsafe fn encode_with_features<const COUNT_ONLY: bool>(
+        &self,
+        text: &str,
+        allowed_special: &HashSet<&str>,
+    ) -> Result<(Vec<Rank>, usize, usize), EncodeError> {
+        self.encode_portable::<COUNT_ONLY>(text, allowed_special)
+    }
+
+    #[inline(always)]
+    fn encode_portable<const COUNT_ONLY: bool>(
+        &self,
+        text: &str,
+        allowed_special: &HashSet<&str>,
+    ) -> Result<(Vec<Rank>, usize, usize), EncodeError> {
         let special_regex = self._get_tl_special_regex();
         let mut ret = vec![];
         let mut parts = Vec::new();
@@ -850,6 +875,36 @@ mod owned_batch_tests {
     }
 
     #[test]
+    fn runtime_dispatch_matches_portable_ids_counts_and_special_boundaries() {
+        let mut texts = vec![String::new(), "é😀\0<S>abc<T>\r\n".to_owned()];
+        for length in [1, 2, 3, 7, 8, 15, 16, 31, 32, 98, 99, 100, 101, 1024] {
+            texts.push("ab ".repeat(length));
+            texts.push("éa\0".repeat(length));
+            texts.push(" ".repeat(length));
+            texts.push("<S>abc<T>".repeat(length));
+        }
+        for pattern in [include_str!("rmcp_pattern.txt"), r"[\s\S]+"] {
+            let model = core(pattern);
+            for allowed in [
+                HashSet::new(),
+                HashSet::from(["<S>"]),
+                HashSet::from(["<S>", "<T>"]),
+            ] {
+                for text in &texts {
+                    assert_eq!(
+                        model.encode_with_count::<false>(text, &allowed).unwrap(),
+                        model.encode_portable::<false>(text, &allowed).unwrap()
+                    );
+                    assert_eq!(
+                        model.encode_with_count::<true>(text, &allowed).unwrap(),
+                        model.encode_portable::<true>(text, &allowed).unwrap()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn counts_match_complete_byte_vocabularies() {
         let mut texts = vec![
             String::new(),
@@ -1112,6 +1167,20 @@ mod owned_batch_tests {
         let allowed = HashSet::new();
         assert_eq!(model.encode("c", &allowed).unwrap().0, [b'c' as Rank]);
         let expected = model.encode(bad, &allowed).unwrap_err();
+        assert_eq!(
+            model
+                .encode_portable::<false>(bad, &allowed)
+                .unwrap_err()
+                .message,
+            expected.message
+        );
+        assert_eq!(
+            model
+                .encode_portable::<true>(bad, &allowed)
+                .unwrap_err()
+                .message,
+            expected.message
+        );
         assert_eq!(
             model.count_tokens(bad, &allowed).unwrap_err().message,
             expected.message
