@@ -335,6 +335,8 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::Arc;
 
+    use regex_automata::Anchored;
+
     use super::{
         GUARDED_PATTERN, RegularPieces, RegularRegex, build_regular_regex, compile_if_guarded,
         is_guarded_whitespace,
