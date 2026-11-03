@@ -1,3 +1,4 @@
+use std::hash::BuildHasher;
 use std::ops::Index;
 
 use rustc_hash::FxHashMap as HashMap;
@@ -98,8 +99,40 @@ impl MediumKey {
 }
 
 #[derive(Clone)]
+struct ShortRanks(hashbrown::HashTable<(u64, Rank)>);
+
+impl ShortRanks {
+    fn with_capacity(count: usize) -> Self {
+        Self(hashbrown::HashTable::with_capacity(count))
+    }
+
+    fn insert(&mut self, key: u64, rank: Rank) {
+        // Packed keys are injective and the consumed input HashMap has unique keys.
+        self.0.insert_unique(
+            rustc_hash::FxBuildHasher.hash_one(key),
+            (key, rank),
+            |entry| rustc_hash::FxBuildHasher.hash_one(entry.0),
+        );
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[inline(always)]
+    fn get(&self, key: &u64) -> Option<&Rank> {
+        self.0
+            .find(rustc_hash::FxBuildHasher.hash_one(key), |entry| {
+                entry.0 == *key
+            })
+            .map(|entry| &entry.1)
+    }
+}
+
+#[derive(Clone)]
 pub(crate) struct EncoderRanks {
-    short: HashMap<u64, Rank>,
+    short: ShortRanks,
     medium: HashMap<MediumKey, Rank>,
     long: HashMap<Vec<u8>, Rank>,
 }
@@ -114,12 +147,15 @@ impl From<HashMap<Vec<u8>, Rank>> for EncoderRanks {
                 _ => 2,
             }] += 1;
         }
-        let mut short = HashMap::with_capacity_and_hasher(counts[0], Default::default());
+        let mut short = ShortRanks::with_capacity(counts[0]);
         let mut medium = HashMap::with_capacity_and_hasher(counts[1], Default::default());
         let mut long = HashMap::with_capacity_and_hasher(counts[2], Default::default());
         for (bytes, rank) in ranks {
             match bytes.len() {
-                0..=7 => short.insert(short_key(&bytes), rank),
+                0..=7 => {
+                    short.insert(short_key(&bytes), rank);
+                    None
+                }
                 8..=15 => medium.insert(MediumKey::from_bytes(&bytes), rank),
                 _ => long.insert(bytes, rank),
             };
@@ -189,6 +225,35 @@ impl Index<&[u8]> for EncoderRanks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_table_preserves_sparse_collision_keys_max_ranks_and_clones() {
+        for count in [0, 1, 2, 15, 16, 17, 63, 64, 65, 255, 256, 257] {
+            let mut actual = ShortRanks::with_capacity(count);
+            let mut expected = HashMap::with_capacity_and_hasher(count, Default::default());
+            assert_eq!(actual.0.capacity(), expected.capacity());
+            for index in 0..count {
+                let key = (index as u64).wrapping_mul(0x9e3779b97f4a7c15);
+                let rank = if index % 3 == 0 {
+                    Rank::MAX
+                } else {
+                    index as Rank
+                };
+                actual.insert(key, rank);
+                expected.insert(key, rank);
+            }
+            let cloned = actual.clone();
+            for (key, rank) in &expected {
+                assert_eq!(actual.get(key), Some(rank));
+                assert_eq!(cloned.get(key), Some(rank));
+            }
+            for key in 0..4096 {
+                assert_eq!(actual.get(&key), expected.get(&key));
+                assert_eq!(cloned.get(&key), expected.get(&key));
+            }
+            assert_eq!(actual.0.len(), expected.len());
+        }
+    }
 
     #[test]
     fn parent_window_matches_all_short_lengths_and_end_alignments() {

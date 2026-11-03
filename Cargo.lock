@@ -545,6 +545,7 @@ version = "0.14.0"
 dependencies = [
  "bstr",
  "fancy-regex",
+ "hashbrown",
  "libc",
  "pyo3",
  "regex",
