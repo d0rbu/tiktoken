@@ -1,7 +1,9 @@
 use std::collections::HashSet;
 
 use pyo3::{
-    IntoPyObjectExt, PyResult, exceptions,
+    IntoPyObjectExt, PyResult,
+    buffer::PyBuffer,
+    exceptions,
     prelude::*,
     pybacked::PyBackedStr,
     types::{PyBytes, PyList},
@@ -166,6 +168,52 @@ impl TokenTierCodec {
             .detach(|| self.codec.decode_ranges(&borrowed))
             .ok_or_else(|| exceptions::PyValueError::new_err("invalid indexed token range"))?;
         TiktokenBuffer::new(decoded).into_py_any(py)
+    }
+
+    /// Write a decoded prefix into private writable native-int64 storage.
+    /// On failure the caller must discard the potentially partially written buffer.
+    fn decode_ranges_into(
+        &self,
+        py: Python<'_>,
+        ranges: Vec<(Py<PyBytes>, Py<PyBytes>, usize, usize, usize)>,
+        destination: &Bound<'_, PyAny>,
+    ) -> PyResult<usize> {
+        let destination = PyBuffer::<i64>::get(destination)?;
+        // Match the direct bit-storage reader: PyO3 also admits opposite-endian formats.
+        let prefix = destination.format().to_bytes().first().copied();
+        let opposite_endian = if cfg!(target_endian = "little") {
+            matches!(prefix, Some(b'>' | b'!'))
+        } else {
+            prefix == Some(b'<')
+        };
+        if opposite_endian {
+            return Err(exceptions::PyBufferError::new_err(
+                "decoded destination must use native byte order",
+            ));
+        }
+        let output = destination.as_mut_slice(py).ok_or_else(|| {
+            exceptions::PyValueError::new_err("decoded destination must be writable and contiguous")
+        })?;
+        let borrowed: Vec<_> = ranges
+            .iter()
+            .map(
+                |(data, checkpoints, tokens, start, count)| rmcp_token_tier::IndexedRange {
+                    data: data.bind(py).as_bytes(),
+                    checkpoints: checkpoints.bind(py).as_bytes(),
+                    tokens: *tokens,
+                    start: *start,
+                    count: *count,
+                },
+            )
+            .collect();
+        // Cell writes retain the GIL, as does the existing direct bit-storage reader.
+        self.codec
+            .decode_ranges_into(&borrowed, output)
+            .ok_or_else(|| {
+                exceptions::PyValueError::new_err(
+                    "invalid indexed token range or destination extent",
+                )
+            })
     }
 
     fn encode_blocks(

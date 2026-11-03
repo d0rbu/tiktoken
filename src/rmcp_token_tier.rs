@@ -1,5 +1,39 @@
 //! Experimental fixed-width common-token tiers; no persistent format selects it.
 
+use std::cell::Cell;
+
+trait Output {
+    fn reserve_tokens(&mut self, count: usize) -> Option<()>;
+    fn push_token(&mut self, value: u32);
+}
+
+impl Output for Vec<u32> {
+    fn reserve_tokens(&mut self, count: usize) -> Option<()> {
+        self.reserve(count);
+        Some(())
+    }
+
+    fn push_token(&mut self, value: u32) {
+        self.push(value);
+    }
+}
+
+struct Destination<'a> {
+    values: &'a [Cell<i64>],
+    used: usize,
+}
+
+impl Output for Destination<'_> {
+    fn reserve_tokens(&mut self, count: usize) -> Option<()> {
+        (self.used.checked_add(count)? <= self.values.len()).then_some(())
+    }
+
+    fn push_token(&mut self, value: u32) {
+        self.values[self.used].set(i64::from(value));
+        self.used += 1;
+    }
+}
+
 pub(crate) struct Codec {
     codes: Vec<(u32, u8)>,
     order: Vec<u32>,
@@ -206,7 +240,24 @@ impl Codec {
             .try_fold(Vec::new(), |output, range| self.append_range(range, output))
     }
 
-    fn append_range(&self, range: &IndexedRange<'_>, output: Vec<u32>) -> Option<Vec<u32>> {
+    pub(crate) fn decode_ranges_into(
+        &self,
+        ranges: &[IndexedRange<'_>],
+        destination: &[Cell<i64>],
+    ) -> Option<usize> {
+        ranges
+            .iter()
+            .try_fold(
+                Destination {
+                    values: destination,
+                    used: 0,
+                },
+                |output, range| self.append_range(range, output),
+            )
+            .map(|output| output.used)
+    }
+
+    fn append_range<O: Output>(&self, range: &IndexedRange<'_>, output: O) -> Option<O> {
         let IndexedRange {
             data,
             checkpoints,
@@ -231,21 +282,21 @@ impl Codec {
         self.decode_at(data, count, position, start % 256, end == tokens, output)
     }
 
-    fn decode_at(
+    fn decode_at<O: Output>(
         &self,
         data: &[u8],
         count: usize,
         mut position: usize,
         skip: usize,
         exact_end: bool,
-        mut output: Vec<u32>,
-    ) -> Option<Vec<u32>> {
+        mut output: O,
+    ) -> Option<O> {
         let total_bits = data.len().checked_mul(8)?;
         let steps = count.checked_add(skip)?;
         if steps > total_bits.checked_sub(position)? / self.widths[0] {
             return None;
         }
-        output.reserve(count);
+        output.reserve_tokens(count)?;
         for step in 0..steps {
             let begin = position / 8;
             let word = if data.len() - begin >= 4 {
@@ -259,7 +310,7 @@ impl Codec {
             let width = self.widths[tier];
             let value = (word >> (32 - width)) & self.masks[tier];
             if step >= skip {
-                output.push(if tier == 3 {
+                output.push_token(if tier == 3 {
                     value
                 } else {
                     self.order[self.bases[tier] + value as usize]
@@ -304,6 +355,68 @@ mod tests {
             bytes[i / 8] |= bit << (7 - i % 8);
         }
         bytes
+    }
+
+    #[test]
+    fn direct_ranges_keep_requested_values_and_unwritten_guards() {
+        let order: Vec<_> = (0..1056).collect();
+        let codec = Codec::new(&order, 5, 10).unwrap();
+        let ids: Vec<u32> = (0..8193).map(|i| (i * 503) % 131072).collect();
+        let (data, checkpoints) = codec.encode_indexed(&raw(&ids)).unwrap();
+        let selections = [(255, 3000), (0, 7), (8192, 1), (8193, 0), (4095, 19)];
+        let ranges: Vec<_> = selections
+            .iter()
+            .map(|&(start, count)| IndexedRange {
+                data: &data,
+                checkpoints: &checkpoints,
+                tokens: ids.len(),
+                start,
+                count,
+            })
+            .collect();
+        let expected: Vec<_> = selections
+            .iter()
+            .flat_map(|&(start, count)| ids[start..start + count].iter().copied())
+            .collect();
+        let output: Vec<_> = (0..expected.len() + 7).map(|_| Cell::new(-777)).collect();
+        assert_eq!(
+            codec.decode_ranges_into(&ranges, &output[2..output.len() - 2]),
+            Some(expected.len())
+        );
+        assert!(output[..2].iter().all(|v| v.get() == -777));
+        assert!(output[expected.len() + 2..].iter().all(|v| v.get() == -777));
+        assert_eq!(
+            output[2..expected.len() + 2]
+                .iter()
+                .map(Cell::get)
+                .collect::<Vec<_>>(),
+            expected.iter().map(|&v| i64::from(v)).collect::<Vec<_>>()
+        );
+        assert_eq!(codec.decode_ranges_into(&[], &[]), Some(0));
+        assert!(codec.decode_ranges_into(&ranges, &output[..100]).is_none());
+    }
+
+    #[test]
+    fn direct_ranges_retain_extent_checkpoint_and_padding_errors() {
+        let codec = Codec::new(&(0..1056).collect::<Vec<_>>(), 5, 10).unwrap();
+        let (data, positions) = codec.encode_indexed(&raw(&[0, 40, 131071])).unwrap();
+        let trailing = [data.as_slice(), &[0]].concat();
+        let output: Vec<_> = (0..8).map(|_| Cell::new(-1)).collect();
+        for (data, checkpoints, start, count) in [
+            (data.as_slice(), positions.as_slice(), 3, 1),
+            (data.as_slice(), &[][..], 0, 1),
+            (&data[..1], positions.as_slice(), 0, 3),
+            (trailing.as_slice(), positions.as_slice(), 0, 3),
+        ] {
+            let bad = IndexedRange {
+                data,
+                checkpoints,
+                tokens: 3,
+                start,
+                count,
+            };
+            assert!(codec.decode_ranges_into(&[bad], &output).is_none());
+        }
     }
 
     #[test]
