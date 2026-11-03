@@ -1,6 +1,7 @@
+use std::hash::Hasher;
 use std::ops::Index;
 
-use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::{FxHashMap as HashMap, FxHasher};
 
 use crate::Rank;
 
@@ -97,9 +98,112 @@ impl MediumKey {
     }
 }
 
+// All four exact keys and their ranks share one cache line. Overflow keeps
+// arbitrary vocabularies exact even if many keys select the same bucket.
+#[repr(C, align(64))]
+#[derive(Clone, Default)]
+struct ShortBucket {
+    keys: [u64; 4],
+    ranks: [Rank; 4],
+    occupied: u8,
+}
+
+impl ShortBucket {
+    #[inline(always)]
+    fn matches(&self, key: u64) -> u8 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            use std::arch::x86_64::{
+                _mm_and_si128, _mm_castsi128_pd, _mm_cmpeq_epi32, _mm_loadu_si128, _mm_movemask_pd,
+                _mm_set1_epi64x, _mm_shuffle_epi32,
+            };
+            // SSE2 is baseline on x86-64. Both loads are wholly within the
+            // four initialized u64 keys. Pair adjacent 32-bit comparisons so
+            // each output bit tests the complete 64-bit key, including NULs.
+            unsafe {
+                let query = _mm_set1_epi64x(key as i64);
+                let first = _mm_cmpeq_epi32(_mm_loadu_si128(self.keys.as_ptr().cast()), query);
+                let last =
+                    _mm_cmpeq_epi32(_mm_loadu_si128(self.keys.as_ptr().add(2).cast()), query);
+                let first = _mm_and_si128(first, _mm_shuffle_epi32(first, 0xb1));
+                let last = _mm_and_si128(last, _mm_shuffle_epi32(last, 0xb1));
+                ((_mm_movemask_pd(_mm_castsi128_pd(first))
+                    | (_mm_movemask_pd(_mm_castsi128_pd(last)) << 2)) as u8)
+                    & self.occupied
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let mut matched = 0;
+            for (index, &stored) in self.keys.iter().enumerate() {
+                if stored == key {
+                    matched |= 1 << index;
+                }
+            }
+            matched & self.occupied
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ShortRanks {
+    buckets: Box<[ShortBucket]>,
+    overflow: HashMap<u64, Rank>,
+}
+
+impl ShortRanks {
+    fn with_capacity(count: usize) -> Self {
+        let buckets = count.div_ceil(2).max(1).next_power_of_two();
+        Self {
+            buckets: vec![ShortBucket::default(); buckets].into_boxed_slice(),
+            overflow: HashMap::default(),
+        }
+    }
+
+    #[inline(always)]
+    fn bucket(&self, key: u64) -> usize {
+        let mut hasher = FxHasher::default();
+        hasher.write_u64(key);
+        hasher.finish() as usize & (self.buckets.len() - 1)
+    }
+
+    fn insert(&mut self, key: u64, rank: Rank) {
+        let index = self.bucket(key);
+        let bucket = &mut self.buckets[index];
+        let slot = bucket.occupied.count_ones() as usize;
+        if slot < 4 {
+            bucket.keys[slot] = key;
+            bucket.ranks[slot] = rank;
+            bucket.occupied |= 1 << slot;
+        } else {
+            self.overflow.insert(key, rank);
+        }
+    }
+
+    #[inline(always)]
+    fn get(&self, key: &u64) -> Option<&Rank> {
+        let bucket = &self.buckets[self.bucket(*key)];
+        let matched = bucket.matches(*key);
+        if matched != 0 {
+            Some(&bucket.ranks[matched.trailing_zeros() as usize])
+        } else {
+            self.overflow.get(key)
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.buckets
+            .iter()
+            .map(|b| b.occupied.count_ones() as usize)
+            .sum::<usize>()
+            + self.overflow.len()
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct EncoderRanks {
-    short: HashMap<u64, Rank>,
+    short: ShortRanks,
     medium: HashMap<MediumKey, Rank>,
     long: HashMap<Vec<u8>, Rank>,
 }
@@ -114,14 +218,18 @@ impl From<HashMap<Vec<u8>, Rank>> for EncoderRanks {
                 _ => 2,
             }] += 1;
         }
-        let mut short = HashMap::with_capacity_and_hasher(counts[0], Default::default());
+        let mut short = ShortRanks::with_capacity(counts[0]);
         let mut medium = HashMap::with_capacity_and_hasher(counts[1], Default::default());
         let mut long = HashMap::with_capacity_and_hasher(counts[2], Default::default());
         for (bytes, rank) in ranks {
             match bytes.len() {
                 0..=7 => short.insert(short_key(&bytes), rank),
-                8..=15 => medium.insert(MediumKey::from_bytes(&bytes), rank),
-                _ => long.insert(bytes, rank),
+                8..=15 => {
+                    medium.insert(MediumKey::from_bytes(&bytes), rank);
+                }
+                _ => {
+                    long.insert(bytes, rank);
+                }
             };
         }
         Self {
@@ -189,6 +297,52 @@ impl Index<&[u8]> for EncoderRanks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_bucket_has_one_cache_line_and_exact_full_word_matches() {
+        assert_eq!(std::mem::size_of::<ShortBucket>(), 64);
+        assert_eq!(std::mem::align_of::<ShortBucket>(), 64);
+        let mut bucket = ShortBucket {
+            keys: [0, 0xffff_ffff, 0xffff_ffff_0000_0000, u64::MAX],
+            ..ShortBucket::default()
+        };
+        for occupied in 0..16 {
+            bucket.occupied = occupied;
+            for key in bucket.keys {
+                for bit in 0..=64 {
+                    let query = if bit == 64 { key } else { key ^ (1 << bit) };
+                    let expected = bucket.keys.iter().enumerate().fold(0, |mask, (i, &k)| {
+                        mask | if k == query { (1 << i) & occupied } else { 0 }
+                    });
+                    assert_eq!(bucket.matches(query), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn short_bucket_overflow_clone_and_empty_key_are_exact() {
+        let mut ranks = ShortRanks::with_capacity(0);
+        assert_eq!(ranks.get(&0), None);
+        for key in 0..12_u64 {
+            ranks.insert(key, if key == 3 { Rank::MAX } else { key as Rank });
+        }
+        assert_eq!(ranks.buckets.len(), 1);
+        assert_eq!(ranks.overflow.len(), 8);
+        assert_eq!(ranks.len(), 12);
+        let cloned = ranks.clone();
+        for key in 0..=12_u64 {
+            let expected = if key == 12 {
+                None
+            } else if key == 3 {
+                Some(Rank::MAX)
+            } else {
+                Some(key as Rank)
+            };
+            assert_eq!(ranks.get(&key).copied(), expected);
+            assert_eq!(cloned.get(&key).copied(), expected);
+        }
+    }
 
     #[test]
     fn parent_window_matches_all_short_lengths_and_end_alignments() {
