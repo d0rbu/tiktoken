@@ -54,7 +54,19 @@ fn short_key_window(source: &[u8], start: usize, length: usize) -> u64 {
     let window = start.min(source.len() - 8);
     let word = u64::from_le_bytes(source[window..window + 8].try_into().unwrap());
     let shift = (start - window) * 8;
-    let mask = (1_u64 << (length * 8)) - 1;
+    // Every caller limits this span to at most seven bytes. Keep the exact
+    // masks in one cache line instead of rebuilding them with a variable shift.
+    const MASKS: [u64; 8] = [
+        0,
+        0xff,
+        0xffff,
+        0xff_ffff,
+        0xffff_ffff,
+        0xff_ffff_ffff,
+        0xffff_ffff_ffff,
+        0xff_ffff_ffff_ffff,
+    ];
+    let mask = MASKS[length];
     ((word >> shift) & mask) | ((length as u64) << 56)
 }
 
