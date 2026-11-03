@@ -39,9 +39,13 @@ impl Codec {
             };
             codes[id as usize] = (code, width);
         }
+        // All four tiers share one decoded-value lookup, including raw 17-bit IDs.
+        let mut decoded = Vec::with_capacity(order.len() + (1 << 17));
+        decoded.extend_from_slice(order);
+        decoded.extend(0..1 << 17);
         Some(Self {
             codes,
-            order: order.to_vec(),
+            order: decoded,
             widths: [
                 usize::from(a + 1),
                 usize::from(a + 1),
@@ -49,7 +53,7 @@ impl Codec {
                 19,
             ],
             masks: [(1 << a) - 1, (1 << a) - 1, (1 << b) - 1, (1 << 17) - 1],
-            bases: [0, 0, small, 0],
+            bases: [0, 0, small, order.len()],
         })
     }
 
@@ -259,11 +263,7 @@ impl Codec {
             let width = self.widths[tier];
             let value = (word >> (32 - width)) & self.masks[tier];
             if step >= skip {
-                output.push(if tier == 3 {
-                    value
-                } else {
-                    self.order[self.bases[tier] + value as usize]
-                });
+                output.push(self.order[self.bases[tier] + value as usize]);
             }
             position += width;
             if position > total_bits {
@@ -327,6 +327,36 @@ mod tests {
         let ids: Vec<_> = (0..131072).collect();
         let bytes = codec.encode(&raw(&ids)).unwrap();
         assert_eq!(codec.decode(&bytes, ids.len()).unwrap(), ids);
+    }
+
+    #[test]
+    fn raw_tier_keeps_original_ids_even_when_the_dictionary_contains_them() {
+        let ids: Vec<_> = (0..131072).collect();
+        // An external stream may use the raw tier for any valid ID, including
+        // dictionary entries. Construct its bits independently of the encoder.
+        let mut encoded = vec![0u8; (ids.len() * 19).div_ceil(8)];
+        for (index, &id) in ids.iter().enumerate() {
+            let code = (3 << 17) | id;
+            for bit in 0..19 {
+                encoded[(index * 19 + bit) / 8] |=
+                    (((code >> (18 - bit)) & 1) as u8) << (7 - (index * 19 + bit) % 8);
+            }
+        }
+        let checkpoints: Vec<_> = (0..ids.len())
+            .step_by(256)
+            .flat_map(|index| ((index * 19) as u32).to_le_bytes())
+            .collect();
+        for (a, b) in [(1, 2), (5, 10), (8, 14)] {
+            let order: Vec<_> = (0..(1 << a) + (1 << b)).map(|i| 131071 - i).collect();
+            let codec = Codec::new(&order, a, b).unwrap();
+            assert_eq!(codec.decode(&encoded, ids.len()).unwrap(), ids);
+            for start in [0, 1, 255, 256, 257, 65535, 131071] {
+                assert_eq!(
+                    codec.decode_range(&encoded, &checkpoints, ids.len(), start, ids.len() - start),
+                    Some(ids[start..].to_vec()),
+                );
+            }
+        }
     }
 
     #[test]
