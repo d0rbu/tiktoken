@@ -48,14 +48,13 @@ fn short_key(bytes: &[u8]) -> u64 {
 // are masked away, so adjacent text cannot affect the existing packed key.
 #[inline(always)]
 fn short_key_window(source: &[u8], start: usize, length: usize) -> u64 {
-    if length == 0 {
-        return 0;
-    }
     let window = start.min(source.len() - 8);
     let word = u64::from_le_bytes(source[window..window + 8].try_into().unwrap());
     let shift = (start - window) * 8;
     let mask = (1_u64 << (length * 8)) - 1;
-    ((word >> shift) & mask) | ((length as u64) << 56)
+    // An empty span may start at source.len(), giving shift == 64. The
+    // wrapping shift is defined there, and the zero mask removes the word.
+    (word.wrapping_shr(shift as u32) & mask) | ((length as u64) << 56)
 }
 
 #[repr(C)]
@@ -207,6 +206,16 @@ mod tests {
             }
         }
         assert_eq!(short_key_window(&[0; 8], 8, 0), short_key(&[]));
+    }
+
+    #[test]
+    fn empty_parent_windows_are_zero_at_every_valid_position() {
+        for length in 8..=64 {
+            let source: Vec<u8> = (0..length).map(|i| (i * 37 + 19) as u8).collect();
+            for start in 0..=length {
+                assert_eq!(short_key_window(&source, start, 0), short_key(&[]));
+            }
+        }
     }
 
     #[test]
