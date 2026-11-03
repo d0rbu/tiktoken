@@ -228,6 +228,140 @@ fn _byte_pair_merge_into(
     }
 }
 
+// Only encode_with_count uses this helper, for pieces of 2..100 bytes.
+// Keep offsets and ranks interleaved while reducing each record from 16 to 8
+// bytes. The general helper above retains usize offsets for public splitting.
+fn _byte_pair_merge_short_into(
+    ranks: &impl RankLookup,
+    piece: &[u8],
+    parts: &mut Vec<(u32, Rank)>,
+    pair_rank: impl Fn(&[u8]) -> Rank,
+) {
+    // Reuse only this encode call's scratch; starts and ranks never carry over.
+    parts.clear();
+    parts.reserve(piece.len() + 1);
+    // This is a vector of (start, rank).
+    // The rank is of the pair starting at position start.
+
+    // Note that we hash bytes when indexing into `ranks`, not token pairs. As long as we train BPE
+    // the way we currently do, this is equivalent. An easy way to break this would be to decouple
+    // merge priority from token index or to prevent specific token merges.
+    let mut min_rank: (Rank, usize) = (Rank::MAX, usize::MAX);
+    for i in 0..piece.len() - 1 {
+        let rank = pair_rank(&piece[i..i + 2]);
+        if rank < min_rank.0 {
+            min_rank = (rank, i);
+        }
+        parts.push((i as u32, rank));
+    }
+    parts.push(((piece.len() - 1) as u32, Rank::MAX));
+    parts.push((piece.len() as u32, Rank::MAX));
+
+    let get_rank = {
+        #[inline(always)]
+        |parts: &Vec<(u32, Rank)>, i: usize| {
+            if (i + 3) < parts.len() {
+                // Similar to `piece[i..i + 2]` above. The +3 is because we haven't yet deleted
+                // parts[i + 1], see comment in the main loop.
+                *ranks
+                    .get_span(piece, parts[i].0 as usize, parts[i + 3].0 as usize)
+                    .unwrap_or(&Rank::MAX)
+            } else {
+                Rank::MAX
+            }
+        }
+    };
+
+    // If you have n parts and m merges, this does O(mn) work.
+    // We could do something with a heap and do O(m log n) work.
+    // n is often very small so considerations like cache-locality outweigh the algorithmic
+    // complexity downsides of the `parts` vector.
+    while min_rank.0 != Rank::MAX {
+        let i = min_rank.1;
+        // Update parts[i] and parts[i - 1] before removing parts[i + 1], since
+        // `parts.remove(i + 1)` will thrash the cache.
+        if i > 0 {
+            parts[i - 1].1 = get_rank(parts, i - 1);
+        }
+        parts[i].1 = get_rank(parts, i);
+        parts.remove(i + 1);
+
+        min_rank = (Rank::MAX, usize::MAX);
+        for (i, &(_, rank)) in parts[..parts.len() - 1].iter().enumerate() {
+            if rank < min_rank.0 {
+                min_rank = (rank, i);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod compact_short_merge_tests {
+    use super::*;
+
+    #[test]
+    fn compact_records_match_complete_reference_boundaries_and_ranks() {
+        assert_eq!(std::mem::size_of::<(u32, Rank)>(), 8);
+        for seed in 0..24_u32 {
+            let piece: Vec<u8> = (0..99)
+                .map(|i| ((i * 37 + seed * 13) % 256) as u8)
+                .collect();
+            let mut map = HashMap::default();
+            for start in 0..piece.len() {
+                for end in start + 1..=(start + 15).min(piece.len()) {
+                    if (start + end + seed as usize) % 3 != 0 {
+                        let rank = match (start + end) % 11 {
+                            0 => Rank::MAX,
+                            1 => Rank::MAX - 1,
+                            2 => 0x8000_0000,
+                            _ => ((start * 7 + end * 3) % 19) as Rank,
+                        };
+                        map.insert(piece[start..end].to_vec(), rank);
+                    }
+                }
+            }
+            let ranks = EncoderRanks::from(map);
+            let mut scratch = Vec::new();
+            // Reuse an already larger allocation across all smaller lengths.
+            for length in (2..100).rev() {
+                let bytes = &piece[..length];
+                let expected = _byte_pair_merge(&ranks, bytes);
+                _byte_pair_merge_short_into(&ranks, bytes, &mut scratch, |pair| {
+                    *ranks.get(pair).unwrap_or(&Rank::MAX)
+                });
+                let actual: Vec<_> = scratch.iter().map(|&(s, r)| (s as usize, r)).collect();
+                assert_eq!(actual, expected, "seed={seed} length={length}");
+            }
+        }
+    }
+
+    #[test]
+    fn compact_records_preserve_leftmost_ties_and_missing_pairs() {
+        for rank in [0, 1, 0x8000_0000, Rank::MAX - 1, Rank::MAX] {
+            for length in 2..100 {
+                let piece = vec![b'x'; length];
+                let mut map = HashMap::default();
+                for width in 1..=length {
+                    map.insert(vec![b'x'; width], rank);
+                }
+                let ranks = EncoderRanks::from(map);
+                let expected = _byte_pair_merge(&ranks, &piece);
+                let mut actual = Vec::new();
+                _byte_pair_merge_short_into(&ranks, &piece, &mut actual, |pair| {
+                    *ranks.get(pair).unwrap_or(&Rank::MAX)
+                });
+                assert_eq!(
+                    actual
+                        .iter()
+                        .map(|&(s, r)| (s as usize, r))
+                        .collect::<Vec<_>>(),
+                    expected
+                );
+            }
+        }
+    }
+}
+
 pub fn byte_pair_encode(piece: &[u8], ranks: &HashMap<Vec<u8>, Rank>) -> Vec<Rank> {
     _byte_pair_encode(piece, ranks)
 }
@@ -511,7 +645,7 @@ impl CoreBPE {
                 }
                 let output_start = ret.len();
                 if piece.len() > 1 && piece.len() < 100 {
-                    _byte_pair_merge_into(&self.encoder, piece, &mut parts, |pair| {
+                    _byte_pair_merge_short_into(&self.encoder, piece, &mut parts, |pair| {
                         self.pair_ranks[pair_index(pair[0], pair[1])]
                     });
                     last_piece_token_len = parts.len() - 1;
@@ -521,7 +655,7 @@ impl CoreBPE {
                         ret.extend(parts.windows(2).map(|part| {
                             *self
                                 .encoder
-                                .get_span(piece, part[0].0, part[1].0)
+                                .get_span(piece, part[0].0 as usize, part[1].0 as usize)
                                 .expect("no entry found for key")
                         }));
                     }
