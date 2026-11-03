@@ -268,6 +268,49 @@ struct OwnedSourceBatch {
     batch: SourceBatch,
 }
 
+#[pyclass]
+struct OwnedEncodedSourceBatch {
+    provenance: Vec<Option<String>>,
+    encoded: Option<Result<(Vec<Rank>, Vec<usize>), crate::EncodeError>>,
+}
+
+#[pymethods]
+impl OwnedEncodedSourceBatch {
+    #[getter]
+    fn provenance(&self) -> Vec<Option<String>> {
+        self.provenance.clone()
+    }
+
+    fn encoded(&mut self, py: Python<'_>) -> PyResult<(Py<PyAny>, Vec<usize>)> {
+        // This is a single-use handoff to the Python encoding boundary. Keep
+        // encoding failures here rather than turning them into source errors.
+        let (ids, lengths) = self
+            .encoded
+            .take()
+            .ok_or_else(|| exceptions::PyRuntimeError::new_err("source batch already consumed"))?
+            .map_err(|error| exceptions::PyValueError::new_err(error.message))?;
+        Ok((TiktokenBuffer::new(ids).into_py_any(py)?, lengths))
+    }
+}
+
+impl CoreBPE {
+    fn encode_source_rows(
+        &self,
+        batch: &SourceBatch,
+        allowed: &HashSet<&str>,
+        eos: Rank,
+    ) -> Result<(Vec<Rank>, Vec<usize>), crate::EncodeError> {
+        let rows = self.encode_batch_serial(batch.texts.iter().map(String::as_str), allowed)?;
+        let lengths: Vec<usize> = rows.iter().map(|row| row.len() + 1).collect();
+        let mut ids = Vec::with_capacity(lengths.iter().sum());
+        for row in rows {
+            ids.extend(row);
+            ids.push(eos);
+        }
+        Ok((ids, lengths))
+    }
+}
+
 #[pymethods]
 impl OwnedSourceCursor {
     fn close(&mut self) {
@@ -310,6 +353,35 @@ impl OwnedSourceBatch {
 
 #[pymethods]
 impl CoreBPE {
+    fn _read_encode_source_batch(
+        &self,
+        py: Python<'_>,
+        mut cursor: PyRefMut<'_, OwnedSourceCursor>,
+        allowed_special: HashSet<PyBackedStr>,
+        eos: Rank,
+        provenance: bool,
+    ) -> PyResult<Option<OwnedEncodedSourceBatch>> {
+        let inner = &mut cursor.cursor;
+        let result = py.detach(|| {
+            let Some(batch) = inner.batch(provenance)? else {
+                return Ok(None);
+            };
+            let allowed = allowed_special.iter().map(|s| s.as_ref()).collect();
+            let encoded = self.encode_source_rows(&batch, &allowed, eos);
+            Ok(Some(OwnedEncodedSourceBatch {
+                provenance: batch.provenance,
+                encoded: Some(encoded),
+            }))
+        });
+        match result {
+            Ok(batch) => Ok(batch),
+            Err(ReadError::Io(error)) => Err(source_io_error(py, error, &cursor.path)),
+            Err(ReadError::Declined) => Err(exceptions::PyNotImplementedError::new_err(
+                "source batch requires the original Python decoder before encoding",
+            )),
+        }
+    }
+
     #[pyo3(signature = (path, split, start, stop=None))]
     fn _open_source(
         &self,
@@ -336,15 +408,7 @@ impl CoreBPE {
     ) -> PyResult<(Py<PyAny>, Vec<usize>)> {
         let result = py.detach(|| {
             let allowed: HashSet<&str> = allowed_special.iter().map(|s| s.as_ref()).collect();
-            let rows =
-                self.encode_batch_serial(batch.batch.texts.iter().map(String::as_str), &allowed)?;
-            let lengths: Vec<usize> = rows.iter().map(|row| row.len() + 1).collect();
-            let mut ids = Vec::with_capacity(lengths.iter().sum());
-            for row in rows {
-                ids.extend(row);
-                ids.push(eos);
-            }
-            Ok::<_, crate::EncodeError>((ids, lengths))
+            self.encode_source_rows(&batch.batch, &allowed, eos)
         });
         let (ids, lengths) =
             result.map_err(|error| exceptions::PyValueError::new_err(error.message))?;

@@ -11,7 +11,9 @@ from tiktoken import _tiktoken
 
 @pytest.fixture
 def core():
-    return _tiktoken.CoreBPE({bytes([i]): i for i in range(256)}, {"<|s|>": 256}, "(?s).")
+    return _tiktoken.CoreBPE(
+        {bytes([i]): i for i in range(256)}, {"<|s|>": 256}, "(?s)."
+    )
 
 
 def encoded(core, cursor, provenance=False):
@@ -46,7 +48,9 @@ def test_all_range_cuts_preserve_ids_lengths_and_raw_metadata(core, tmp_path):
         ids, lengths, provenance = [], [], []
         for start in range(0, len(data), width):
             with closing(
-                core._open_source(str(path), "train", start, min(start + width, len(data)))
+                core._open_source(
+                    str(path), "train", start, min(start + width, len(data))
+                )
             ) as cursor:
                 output = encoded(core, cursor, True)
                 ids.extend(output[0])
@@ -113,8 +117,12 @@ def test_open_error_preserves_python_errno_strerror_and_filename(core, tmp_path)
 def test_shared_core_has_independent_bounded_cursors_across_threads(core, tmp_path):
     path = tmp_path / "source"
     texts = ["a" * 17, "b" * (1024 * 1024), "é😀<|s|>"]
-    path.write_text("\n".join(json.dumps({"split": "train", "text": text}) for text in texts))
-    expected = [token for text in texts for token in [*core.encode(text, {"<|s|>"}), 257]]
+    path.write_text(
+        "\n".join(json.dumps({"split": "train", "text": text}) for text in texts)
+    )
+    expected = [
+        token for text in texts for token in [*core.encode(text, {"<|s|>"}), 257]
+    ]
 
     def worker(_):
         with closing(core._open_source(str(path), "train", 0)) as cursor:
@@ -125,3 +133,79 @@ def test_shared_core_has_independent_bounded_cursors_across_threads(core, tmp_pa
 
     with ThreadPoolExecutor(max_workers=16) as pool:
         list(pool.map(worker, range(32)))
+
+
+def test_combined_read_encode_preserves_split_api_outputs_and_replay(core, tmp_path):
+    path = tmp_path / "combined"
+    row = b'{"split":"train","text":"ok<|s|>","token_provenance":{"id":9007199254740993}}\n'
+    bad = b'{"split":"train","text":"\\ud800"}\n'
+    path.write_bytes(row * 65 + bad)
+
+    def run(combined):
+        result = []
+        with closing(core._open_source(str(path), "train", 0)) as cursor:
+            while True:
+                try:
+                    if combined:
+                        batch = core._read_encode_source_batch(
+                            cursor, {"<|s|>"}, 257, True
+                        )
+                    else:
+                        batch = cursor.read_batch(True)
+                except NotImplementedError:
+                    return result, b"".join(cursor)
+                if batch is None:
+                    return result, b""
+                buffer, lengths = (
+                    batch.encoded()
+                    if combined
+                    else core._encode_source_batch(batch, {"<|s|>"}, 257)
+                )
+                result.append((memoryview(buffer).tolist(), lengths, batch.provenance))
+
+    assert run(True) == run(False)
+    assert run(True)[1] == row + bad
+
+
+def test_combined_read_defers_encoding_failure_to_encoding_boundary(tmp_path):
+    core = _tiktoken.CoreBPE(
+        {bytes([i]): i for i in range(256)}, {}, r"(?i)(a|b|ab)*(?>c)(?!$)"
+    )
+    path = tmp_path / "missing-byte"
+    path.write_text(json.dumps({"split": "train", "text": "ab" * 64 + "c"}) + "\n")
+    with closing(core._open_source(str(path), "train", 0)) as cursor:
+        # Parsing succeeded. The encode error must not become a source error.
+        batch = core._read_encode_source_batch(cursor, set(), 257, False)
+        assert batch is not None
+        with pytest.raises(ValueError) as combined:
+            batch.encoded()
+        assert core._read_encode_source_batch(cursor, set(), 257, False) is None
+    with closing(core._open_source(str(path), "train", 0)) as cursor:
+        split = cursor.read_batch(False)
+        with pytest.raises(ValueError) as original:
+            core._encode_source_batch(split, set(), 257)
+    assert combined.value.args == original.value.args
+    with pytest.raises(RuntimeError, match="already consumed"):
+        batch.encoded()
+
+
+def test_combined_shared_core_concurrent_cursors(core, tmp_path):
+    path = tmp_path / "threaded"
+    row = {"split": "train", "text": "é😀<|s|>"}
+    path.write_text((json.dumps(row) + "\n") * 130)
+    expected = (core.encode(row["text"], {"<|s|>"}) + [257]) * 130
+
+    def run(_):
+        ids = []
+        with closing(core._open_source(str(path), "train", 0)) as cursor:
+            while (
+                batch := core._read_encode_source_batch(cursor, {"<|s|>"}, 257, False)
+            ) is not None:
+                buffer, lengths = batch.encoded()
+                ids.extend(memoryview(buffer).tolist())
+                assert sum(lengths) == len(memoryview(buffer))
+                assert batch.provenance == []
+        assert ids == expected
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(run, range(16)))
