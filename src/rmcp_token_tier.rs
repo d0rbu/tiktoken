@@ -246,7 +246,30 @@ impl Codec {
             return None;
         }
         output.reserve(count);
-        for step in 0..steps {
+        // Two maximal 19-bit codes fit in the 57 bits retained by a full
+        // eight-byte window even at the last bit alignment. The bounded tail
+        // is zero padded, then checked against the original real bit extent.
+        for pair in 0..steps / 2 {
+            let begin = position / 8;
+            let word = if data.len() - begin >= 8 {
+                u64::from_be_bytes(data[begin..begin + 8].try_into().unwrap())
+            } else {
+                let mut bytes = [0; 8];
+                bytes[..data.len() - begin].copy_from_slice(&data[begin..]);
+                u64::from_be_bytes(bytes)
+            } << (position % 8);
+            let first_width = self.append_word((word >> 32) as u32, pair * 2 >= skip, &mut output);
+            let second_width = self.append_word(
+                ((word << first_width) >> 32) as u32,
+                pair * 2 + 1 >= skip,
+                &mut output,
+            );
+            position += first_width + second_width;
+            if position > total_bits {
+                return None;
+            }
+        }
+        if steps % 2 != 0 {
             let begin = position / 8;
             let word = if data.len() - begin >= 4 {
                 u32::from_be_bytes(data[begin..begin + 4].try_into().unwrap())
@@ -255,17 +278,7 @@ impl Codec {
                 bytes[..data.len() - begin].copy_from_slice(&data[begin..]);
                 u32::from_be_bytes(bytes)
             } << (position % 8);
-            let tier = (word >> 30) as usize;
-            let width = self.widths[tier];
-            let value = (word >> (32 - width)) & self.masks[tier];
-            if step >= skip {
-                output.push(if tier == 3 {
-                    value
-                } else {
-                    self.order[self.bases[tier] + value as usize]
-                });
-            }
-            position += width;
+            position += self.append_word(word, steps - 1 >= skip, &mut output);
             if position > total_bits {
                 return None;
             }
@@ -278,6 +291,21 @@ impl Codec {
             }
         }
         Some(output)
+    }
+
+    #[inline]
+    fn append_word(&self, word: u32, emit: bool, output: &mut Vec<u32>) -> usize {
+        let tier = (word >> 30) as usize;
+        let width = self.widths[tier];
+        if emit {
+            let value = (word >> (32 - width)) & self.masks[tier];
+            output.push(if tier == 3 {
+                value
+            } else {
+                self.order[self.bases[tier] + value as usize]
+            });
+        }
+        width
     }
 }
 
@@ -304,6 +332,128 @@ mod tests {
             bytes[i / 8] |= bit << (7 - i % 8);
         }
         bytes
+    }
+
+    #[test]
+    fn paired_ranges_match_original_values_at_every_checkpoint_offset() {
+        for (a, b) in [(1, 2), (5, 10), (8, 14)] {
+            let order: Vec<_> = (0..(1 << a) + (1 << b)).collect();
+            let codec = Codec::new(&order, a, b).unwrap();
+            let ids: Vec<u32> = (0..1793).map(|i| (i * 503) % 131072).collect();
+            let (data, checkpoints) = codec.encode_indexed(&raw(&ids)).unwrap();
+            for start in 0..512 {
+                for count in [1, 2, 3, 256, 257, 776, 777] {
+                    assert_eq!(
+                        codec.decode_range(&data, &checkpoints, ids.len(), start, count),
+                        Some(ids[start..start + count].to_vec())
+                    );
+                }
+            }
+            let ranges = [(257, 511), (0, 1), (1793, 0), (1792, 1), (511, 777)];
+            let commands: Vec<_> = ranges
+                .iter()
+                .map(|&(start, count)| IndexedRange {
+                    data: &data,
+                    checkpoints: &checkpoints,
+                    tokens: ids.len(),
+                    start,
+                    count,
+                })
+                .collect();
+            let expected: Vec<_> = ranges
+                .iter()
+                .flat_map(|&(start, count)| ids[start..start + count].iter().copied())
+                .collect();
+            assert_eq!(codec.decode_ranges(&commands), Some(expected));
+        }
+    }
+
+    #[test]
+    fn paired_ranges_reject_truncation_in_prefix_and_output_and_bad_padding() {
+        let codec = Codec::new(&(0..1056).collect::<Vec<_>>(), 5, 10).unwrap();
+        let ids: Vec<u32> = (0..769).map(|i| (i * 503) % 131072).collect();
+        let (data, checkpoints) = codec.encode_indexed(&raw(&ids)).unwrap();
+        for end in [0, 1, data.len() / 2] {
+            assert!(
+                codec
+                    .decode_range(&data[..end], &checkpoints, ids.len(), 127, 600)
+                    .is_none()
+            );
+        }
+        let mut tail = data.clone();
+        tail.push(0);
+        assert!(
+            codec
+                .decode_range(&tail, &checkpoints, ids.len(), 255, 514)
+                .is_none()
+        );
+        let good = IndexedRange {
+            data: &data,
+            checkpoints: &checkpoints,
+            tokens: ids.len(),
+            start: 257,
+            count: 300,
+        };
+        let bad = IndexedRange {
+            data: &tail,
+            checkpoints: &checkpoints,
+            tokens: ids.len(),
+            start: 255,
+            count: 514,
+        };
+        assert!(codec.decode_ranges(&[good, bad]).is_none());
+    }
+
+    #[test]
+    fn paired_windows_match_independent_bits_at_every_alignment_and_tail() {
+        for (a, b) in [(1, 2), (5, 10), (8, 14)] {
+            let order: Vec<_> = (0..(1 << a) + (1 << b)).collect();
+            let codec = Codec::new(&order, a, b).unwrap();
+            for count in 1..=32 {
+                let ids: Vec<_> = (0..count)
+                    .map(|i| [order[0], order[1 << a], 131071][(i / 3 + i) % 3])
+                    .collect();
+                let bits: usize = ids
+                    .iter()
+                    .map(|&id| {
+                        if id < 1 << a {
+                            a as usize + 1
+                        } else if id < (1 << a) + (1 << b) {
+                            b as usize + 2
+                        } else {
+                            19
+                        }
+                    })
+                    .sum();
+                let encoded = oracle(&ids, &order, a as usize, b as usize);
+                for offset in 0..8 {
+                    let mut shifted = vec![0u8; (offset + bits).div_ceil(8)];
+                    for bit in 0..bits {
+                        shifted[(offset + bit) / 8] |=
+                            ((encoded[bit / 8] >> (7 - bit % 8)) & 1) << (7 - (offset + bit) % 8);
+                    }
+                    assert_eq!(
+                        codec.decode_at(&shifted, ids.len(), offset, 0, true, Vec::new()),
+                        Some(ids.clone())
+                    );
+                    for end in 0..shifted.len() {
+                        assert!(
+                            codec
+                                .decode_at(&shifted[..end], ids.len(), offset, 0, true, Vec::new())
+                                .is_none()
+                        );
+                    }
+                    if (offset + bits) % 8 != 0 {
+                        *shifted.last_mut().unwrap() |= 1;
+                        assert!(
+                            codec
+                                .decode_at(&shifted, ids.len(), offset, 0, true, Vec::new())
+                                .is_none()
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
