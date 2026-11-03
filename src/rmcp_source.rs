@@ -6,6 +6,8 @@ use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
 use std::os::fd::AsRawFd;
 use std::path::Path;
 
+use serde::de::{MapAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 use serde_json::value::RawValue;
 
 pub(crate) struct Batch {
@@ -123,20 +125,7 @@ impl Cursor {
                 }
             };
             // Borrow exact JSON operands rather than normalizing source metadata.
-            let parsed = serde_json::from_slice::<HashMap<String, Box<RawValue>>>(&line);
-            let document = parsed.ok().and_then(|row| {
-                let split: String = serde_json::from_str(row.get("split")?.get()).ok()?;
-                if split != self.split {
-                    return Some(None);
-                }
-                let text: String = serde_json::from_str(row.get("text")?.get()).ok()?;
-                let original = if provenance {
-                    row.get("token_provenance").map(|v| v.get().to_owned())
-                } else {
-                    None
-                };
-                Some(Some((text, original)))
-            });
+            let document = parse_document(&line, &self.split, provenance);
             match document {
                 None => {
                     // No encoding has happened for this batch. Python consumes
@@ -173,6 +162,76 @@ impl Cursor {
             Ok(Some(result))
         }
     }
+}
+
+type SelectedDocument = Option<(String, Option<String>)>;
+
+fn parse_original(line: &[u8], split: &str, provenance: bool) -> Option<SelectedDocument> {
+    let row = serde_json::from_slice::<HashMap<String, Box<RawValue>>>(line).ok()?;
+    let row_split: String = serde_json::from_str(row.get("split")?.get()).ok()?;
+    if row_split != split {
+        return Some(None);
+    }
+    let text: String = serde_json::from_str(row.get("text")?.get()).ok()?;
+    let original = if provenance {
+        row.get("token_provenance")
+            .map(|value| value.get().to_owned())
+    } else {
+        None
+    };
+    Some(Some((text, original)))
+}
+
+#[derive(Default)]
+struct SourceFields {
+    split: Option<String>,
+    text: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for SourceFields {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct FieldsVisitor;
+        impl<'de> Visitor<'de> for FieldsVisitor {
+            type Value = SourceFields;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a source record object")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut fields = SourceFields::default();
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "split" => fields.split = Some(map.next_value::<String>()?),
+                        "text" => fields.text = Some(map.next_value::<String>()?),
+                        _ => {
+                            // Fully decode unknown values before discarding them.
+                            // Lazy skipping admitted malformed escapes in an earlier trial.
+                            let _: sonic_rs::Value = map.next_value()?;
+                        }
+                    }
+                }
+                Ok(fields)
+            }
+        }
+        deserializer.deserialize_map(FieldsVisitor)
+    }
+}
+
+fn parse_simd(line: &[u8], split: &str) -> Option<SelectedDocument> {
+    let fields = sonic_rs::from_slice::<SourceFields>(line).ok()?;
+    if fields.split.as_deref()? != split {
+        return Some(None);
+    }
+    Some(Some((fields.text?, None)))
+}
+
+fn parse_document(line: &[u8], split: &str, provenance: bool) -> Option<SelectedDocument> {
+    if provenance {
+        // Preserve raw provenance bytes without reserializing a parsed value.
+        return parse_original(line, split, true);
+    }
+    parse_simd(line, split).or_else(|| parse_original(line, split, false))
 }
 
 #[cfg(test)]
@@ -343,5 +402,117 @@ mod tests {
         let mut stopped = Cursor::open(&fixture.0, "train".into(), 0, Some(0)).unwrap();
         assert!(batch(&mut stopped, false).is_none());
         assert!(stopped.input.is_none());
+    }
+}
+
+#[cfg(test)]
+mod simd_parser_tests {
+    use super::*;
+
+    fn equal(line: &[u8]) {
+        for split in ["train", "eval", "", "é"] {
+            for provenance in [false, true] {
+                assert_eq!(
+                    parse_document(line, split, provenance),
+                    parse_original(line, split, provenance),
+                    "line={line:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_keys_excluded_rows_and_raw_provenance_remain_exact() {
+        for line in [
+            r#"{"split":"train","text":"a","token_provenance": { "n":9007199254740993, "f":-0.0 }}"#,
+            r#"{"split":"eval","text":null,"unknown":[1,2]}"#,
+            r#"{"split":"eval","split":"train","text":"old","text":"new"}"#,
+            r#"{"sp\u006cit":"train","text":"a","te\u0078t":"b"}"#,
+            r#"{"split":"train","text":"a","token_provenance":null}"#,
+            r#"{"split":"train","text":"a","token_provenance":1e9999}"#,
+            r#"{"split":"train","text":"a","unknown":"\ud800"}"#,
+            r#"{"split":"train","text":"\ud800"}"#,
+            r#"{"split":"train","text":"a"} false"#,
+            r#"{"split":"train","text":"a","token_provenance":{"x":1,"x":2}}"#,
+        ] {
+            equal(line.as_bytes());
+        }
+    }
+
+    #[test]
+    fn every_unicode_scalar_and_surrogate_boundaries_are_exact() {
+        let text: String = (0..=0x10ffff).filter_map(char::from_u32).collect();
+        let line = format!(
+            "{{\"split\":\"train\",\"text\":{}}}",
+            serde_json::to_string(&text).unwrap()
+        );
+        equal(line.as_bytes());
+        for high in [0xd800, 0xd801, 0xdaff, 0xdbfe, 0xdbff] {
+            for low in [0xdc00, 0xdc01, 0xddff, 0xdffe, 0xdfff] {
+                let line = format!(r#"{{"split":"train","text":"\u{high:04x}\u{low:04x}"}}"#);
+                equal(line.as_bytes());
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_mutations_keep_original_decline_or_selection() {
+        let inputs: &[&[u8]] = &[
+            br#"{"split":"train","text":"hello\nworld","unknown":[1,true,null,{"x":2}]}"#,
+            br#"{"split":"eval","text":"\ud800","unknown":-1.25e+10}"#,
+            br#"{"split":"train","text":"hello","token_provenance":[1,2]}"#,
+        ];
+        for original in inputs {
+            for end in 0..=original.len() {
+                equal(&original[..end]);
+            }
+            for i in 0..original.len() {
+                for byte in [
+                    0, 9, 10, 13, 31, b'"', b'\\', b'{', b'}', b'[', b']', b':', b',', b'0', 0x80,
+                    0xff,
+                ] {
+                    let mut changed = original.to_vec();
+                    changed[i] = byte;
+                    equal(&changed);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nested_unknown_values_keep_raw_precision_and_replay_behavior() {
+        for depth in [0, 1, 2, 31, 63, 126, 127, 128, 129, 254, 255, 256, 512] {
+            let nested = format!("{}9007199254740993{}", "[".repeat(depth), "]".repeat(depth));
+            for field in ["unknown", "token_provenance"] {
+                let line = format!(r#"{{"split":"train","text":"ok","{field}":{nested}}}"#);
+                equal(line.as_bytes());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod selected_field_tests {
+    use super::*;
+
+    #[test]
+    fn typed_visitor_falls_back_for_early_wrong_types_and_keeps_last_values() {
+        for line in [
+            r#"{"split":null,"split":"train","text":"ok"}"#,
+            r#"{"split":"train","text":[],"text":"ok"}"#,
+            r#"{"text":"ok","split":"eval","text":null}"#,
+            r#"{"split":"train","text":"first","text":"last","unknown":"\u0000"}"#,
+            r#"{"split":"train","text":"ok","unknown":{"x":"\ud800"}}"#,
+            r#"{"split":"train","text":"ok","unknown":true,"unknown":{}}"#,
+        ] {
+            for split in ["train", "eval"] {
+                for provenance in [false, true] {
+                    assert_eq!(
+                        parse_document(line.as_bytes(), split, provenance),
+                        parse_original(line.as_bytes(), split, provenance)
+                    );
+                }
+            }
+        }
     }
 }
