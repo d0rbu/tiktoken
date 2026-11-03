@@ -197,7 +197,7 @@ fn _byte_pair_merge_into(
                 // Similar to `piece[i..i + 2]` above. The +3 is because we haven't yet deleted
                 // parts[i + 1], see comment in the main loop.
                 *ranks
-                    .get(&piece[parts[i].0..parts[i + 3].0])
+                    .get_span(piece, parts[i].0, parts[i + 3].0)
                     .unwrap_or(&Rank::MAX)
             } else {
                 Rank::MAX
@@ -491,7 +491,8 @@ impl CoreBPE {
                 };
 
                 let piece = piece.as_bytes();
-                if let Some(token) = self.encoder.get(piece) {
+                let piece_start = piece.as_ptr() as usize - text.as_ptr() as usize;
+                if let Some(token) = self.encoder.get_span(text.as_bytes(), piece_start, piece_start + piece.len()) {
                     last_piece_token_len = 1;
                     if COUNT_ONLY {
                         count += 1;
@@ -517,7 +518,7 @@ impl CoreBPE {
                         ret.extend(
                             parts
                                 .windows(2)
-                                .map(|part| self.encoder[&piece[part[0].0..part[1].0]]),
+                                .map(|part| *self.encoder.get_span(piece, part[0].0, part[1].0).expect("no entry found for key")),
                         );
                     }
                 } else {
