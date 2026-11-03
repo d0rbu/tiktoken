@@ -267,8 +267,9 @@ where
 
 pub(crate) struct RegularPieces<'r, 't> {
     regex: &'r RegularRegex,
+    // The unconsumed suffix starts at the next anchored match. Keeping the
+    // borrowed slice avoids reconstructing it from an offset for each piece.
     text: &'t str,
-    input: Input<'t>,
     cache: PoolGuard<'r, dfa::Cache, CacheFactory>,
 }
 
@@ -277,7 +278,6 @@ impl<'r, 't> RegularPieces<'r, 't> {
         Self {
             regex,
             text,
-            input: Input::new(text).anchored(Anchored::Yes),
             cache: regex.caches.get(),
         }
     }
@@ -288,45 +288,45 @@ impl<'t> Iterator for RegularPieces<'_, 't> {
 
     #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
-        let start = self.input.start();
-        if start == self.text.len() {
+        if self.text.is_empty() {
             return None;
         }
         if self.regex.ascii_guarded
-            && let Some(length) = ascii_piece_len(&self.text[start..])
+            && let Some(length) = ascii_piece_len(self.text)
         {
-            let end = start + length;
-            self.input.set_start(end);
-            return Some(&self.text[start..end]);
+            let (piece, remaining) = self.text.split_at(length);
+            self.text = remaining;
+            return Some(piece);
         }
-        self.next_unicode(start)
+        self.next_unicode()
     }
 }
 
 impl<'t> RegularPieces<'_, 't> {
     // Keep the complete DFA/error/whitespace path outside the common ASCII loop.
     #[inline(never)]
-    fn next_unicode(&mut self, start: usize) -> Option<&'t str> {
+    fn next_unicode(&mut self) -> Option<&'t str> {
         // No quit bytes, word boundaries, or cache give-up limits are enabled;
         // this exact nonempty pattern covers each scalar at the anchored start.
-        let matched = match_state_search(&self.regex.dfa, &mut self.cache, &self.text[start..])
+        let matched = match_state_search(&self.regex.dfa, &mut self.cache, self.text)
             .expect("guarded forward DFA cannot quit")?;
-        let mut end = start + matched;
+        let mut end = matched;
 
         // EOF belongs to this ordinary segment even if an allowed special
         // follows. Otherwise withhold the final whitespace scalar exactly as
         // before, then restart ALL alternatives there (including contractions).
         if end < self.text.len() {
-            let (final_offset, final_scalar) = self.text[start..end]
+            let (final_offset, final_scalar) = self.text[..end]
                 .char_indices()
                 .next_back()
                 .expect("the guarded alternatives are nonempty");
             if is_guarded_whitespace(final_scalar) && final_offset > 0 {
-                end = start + final_offset;
+                end = final_offset;
             }
         }
-        self.input.set_start(end);
-        Some(&self.text[start..end])
+        let (piece, remaining) = self.text.split_at(end);
+        self.text = remaining;
+        Some(piece)
     }
 }
 
@@ -334,8 +334,6 @@ impl<'t> RegularPieces<'_, 't> {
 mod tests {
     use std::collections::HashSet;
     use std::sync::Arc;
-
-    use regex_automata::Anchored;
 
     use super::{
         GUARDED_PATTERN, RegularPieces, RegularRegex, build_regular_regex, compile_if_guarded,
@@ -649,10 +647,8 @@ mod tests {
         let mut actual = Vec::new();
         let mut saw_restart = false;
         loop {
-            assert_eq!(pieces.input.get_anchored(), Anchored::Yes);
-            assert!(!pieces.input.get_earliest());
             let Some(piece) = pieces.next() else { break };
-            saw_restart |= piece == " " && text[pieces.input.start()..].starts_with(" ");
+            saw_restart |= piece == " " && pieces.text.starts_with(" ");
             actual.push(piece);
         }
         assert!(saw_restart);
