@@ -211,7 +211,7 @@ impl TokenTierCodec {
             .decode_ranges_into(&borrowed, output)
             .ok_or_else(|| {
                 exceptions::PyValueError::new_err(
-                    "invalid indexed token range or destination extent",
+                    "invalid indexed token range",
                 )
             })
     }

@@ -96,7 +96,7 @@ def test_direct_ranges_match_original_ids_and_keep_destination_tail(a, b):
     assert np.all(storage[:2] == -777)
     assert np.all(storage[written + 2 :] == -777)
     assert codec.decode_ranges_into([], np.empty(0, dtype=np.int64)) == 0
-    with pytest.raises(ValueError, match="destination extent"):
+    with pytest.raises(ValueError, match="invalid indexed token range"):
         codec.decode_ranges_into(ranges, np.empty(2, dtype=np.int64))
 
 
