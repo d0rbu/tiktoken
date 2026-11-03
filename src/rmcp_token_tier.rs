@@ -259,11 +259,13 @@ impl Codec {
             let width = self.widths[tier];
             let value = (word >> (32 - width)) & self.masks[tier];
             if step >= skip {
-                output.push(if tier == 3 {
-                    value
-                } else {
-                    self.order[self.bases[tier] + value as usize]
-                });
+                // Raw IDs use the inert first entry instead of indexing the
+                // dictionary by their arbitrary value. Select the raw/dictionary
+                // result with masks, keeping the original small codebook.
+                let common = 0usize.wrapping_sub(usize::from(tier != 3));
+                let mapped = self.order[(self.bases[tier] + value as usize) & common];
+                let common = common as u32;
+                output.push((mapped & common) | (value & !common));
             }
             position += width;
             if position > total_bits {
@@ -287,6 +289,77 @@ mod tests {
 
     fn raw(ids: &[u32]) -> Vec<u8> {
         ids.iter().flat_map(|id| id.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn masked_dictionary_values_match_independent_bits_for_malformed_tails_and_offsets() {
+        fn decode_bits(
+            codec: &Codec,
+            data: &[u8],
+            count: usize,
+            mut position: usize,
+            skip: usize,
+            exact: bool,
+        ) -> Option<Vec<u32>> {
+            let total = data.len().checked_mul(8)?;
+            let steps = count.checked_add(skip)?;
+            if steps > total.checked_sub(position)? / codec.widths[0] {
+                return None;
+            }
+            let bit = |i: usize| u32::from((data[i / 8] >> (7 - i % 8)) & 1);
+            let mut output = vec![42];
+            for step in 0..steps {
+                if position + 2 > total {
+                    return None;
+                }
+                let tier = ((bit(position) << 1) | bit(position + 1)) as usize;
+                let width = codec.widths[tier];
+                if position + width > total {
+                    return None;
+                }
+                let word = (position..position + width).fold(0, |word, i| (word << 1) | bit(i));
+                let value = word & codec.masks[tier];
+                if step >= skip {
+                    output.push(if tier == 3 {
+                        value
+                    } else {
+                        codec.order[codec.bases[tier] + value as usize]
+                    });
+                }
+                position += width;
+            }
+            if exact
+                && (position.div_ceil(8) != data.len() || (position..total).any(|i| bit(i) != 0))
+            {
+                return None;
+            }
+            Some(output)
+        }
+        for (a, b) in [(1, 2), (5, 10), (8, 14)] {
+            let order: Vec<_> = (0..(1 << a) + (1 << b)).collect();
+            let codec = Codec::new(&order, a, b).unwrap();
+            for size in 0..25 {
+                let data: Vec<u8> = (0..size)
+                    .map(|i| ((i * 173 + size * 71) % 256) as u8)
+                    .collect();
+                for position in 0..=size * 8 + 1 {
+                    for (count, skip) in [(0, 0), (1, 0), (2, 1), (7, 3), (19, 7)] {
+                        for exact in [false, true] {
+                            assert_eq!(
+                                codec.decode_at(&data, count, position, skip, exact, vec![42]),
+                                decode_bits(&codec, &data, count, position, skip, exact),
+                                "size={size}, position={position}, count={count}, skip={skip}, exact={exact}"
+                            );
+                        }
+                    }
+                }
+            }
+            assert!(
+                codec
+                    .decode_at(&[], usize::MAX, 0, 1, false, vec![])
+                    .is_none()
+            );
+        }
     }
 
     fn oracle(ids: &[u32], order: &[u32], a: usize, b: usize) -> Vec<u8> {
