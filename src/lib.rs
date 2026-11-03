@@ -158,17 +158,20 @@ fn _byte_pair_merge_large(ranks: &impl RankLookup, piece: &[u8]) -> Vec<Rank> {
 
 fn _byte_pair_merge(ranks: &impl RankLookup, piece: &[u8]) -> Vec<(usize, Rank)> {
     let mut parts = Vec::with_capacity(piece.len() + 1);
-    _byte_pair_merge_into(ranks, piece, &mut parts, |pair| {
-        *ranks.get(pair).unwrap_or(&Rank::MAX)
-    });
+    _byte_pair_merge_into(
+        piece,
+        &mut parts,
+        |pair| *ranks.get(pair).unwrap_or(&Rank::MAX),
+        |start, end| *ranks.get_span(piece, start, end).unwrap_or(&Rank::MAX),
+    );
     parts
 }
 
 fn _byte_pair_merge_into(
-    ranks: &impl RankLookup,
     piece: &[u8],
     parts: &mut Vec<(usize, Rank)>,
     pair_rank: impl Fn(&[u8]) -> Rank,
+    span_rank: impl Fn(usize, usize) -> Rank,
 ) {
     // Reuse only this encode call's scratch; starts and ranks never carry over.
     parts.clear();
@@ -196,9 +199,7 @@ fn _byte_pair_merge_into(
             if (i + 3) < parts.len() {
                 // Similar to `piece[i..i + 2]` above. The +3 is because we haven't yet deleted
                 // parts[i + 1], see comment in the main loop.
-                *ranks
-                    .get_span(piece, parts[i].0, parts[i + 3].0)
-                    .unwrap_or(&Rank::MAX)
+                span_rank(parts[i].0, parts[i + 3].0)
             } else {
                 Rank::MAX
             }
@@ -511,9 +512,19 @@ impl CoreBPE {
                 }
                 let output_start = ret.len();
                 if piece.len() > 1 && piece.len() < 100 {
-                    _byte_pair_merge_into(&self.encoder, piece, &mut parts, |pair| {
-                        self.pair_ranks[pair_index(pair[0], pair[1])]
-                    });
+                    // The immutable document provides a bounded key window even
+                    // when this regex piece is shorter than eight bytes.
+                    _byte_pair_merge_into(
+                        piece,
+                        &mut parts,
+                        |pair| self.pair_ranks[pair_index(pair[0], pair[1])],
+                        |start, end| {
+                            *self
+                                .encoder
+                                .get_span(text.as_bytes(), piece_start + start, piece_start + end)
+                                .unwrap_or(&Rank::MAX)
+                        },
+                    );
                     last_piece_token_len = parts.len() - 1;
                     if COUNT_ONLY {
                         count += last_piece_token_len;
@@ -521,7 +532,11 @@ impl CoreBPE {
                         ret.extend(parts.windows(2).map(|part| {
                             *self
                                 .encoder
-                                .get_span(piece, part[0].0, part[1].0)
+                                .get_span(
+                                    text.as_bytes(),
+                                    piece_start + part[0].0,
+                                    piece_start + part[1].0,
+                                )
                                 .expect("no entry found for key")
                         }));
                     }
@@ -833,6 +848,65 @@ mod owned_batch_tests {
     use rustc_hash::FxHashMap as HashMap;
 
     use crate::{CoreBPE, MAX_NUM_THREADS, Rank};
+
+    #[test]
+    fn enclosing_document_merge_spans_match_piece_local_original_map() {
+        for seed in 0..6_u32 {
+            let bytes: Vec<u8> = (0..48)
+                .map(|index| ((index * 37 + seed * 13) % 256) as u8)
+                .collect();
+            let mut ranks: HashMap<Vec<u8>, Rank> = (0_u16..256)
+                .map(|byte| (vec![byte as u8], byte as Rank))
+                .collect();
+            for start in 0..bytes.len() {
+                for end in start + 2..=(start + 15).min(bytes.len()) {
+                    if (start + end) % 3 != 0 {
+                        let rank = if (start + end) % 17 == 0 {
+                            Rank::MAX
+                        } else {
+                            256 + ((start * 11 + end * 7) % 113) as Rank
+                        };
+                        ranks.insert(bytes[start..end].to_vec(), rank);
+                    }
+                }
+            }
+            let packed = crate::rmcp_ranks::EncoderRanks::from(ranks.clone());
+            for length in 1..=bytes.len() {
+                let piece = &bytes[..length];
+                let expected = crate::_byte_pair_encode(piece, &ranks);
+                for prefix in 0..=9 {
+                    for suffix in 0..=9 {
+                        let mut document = vec![0xff; prefix];
+                        document.extend_from_slice(piece);
+                        document.extend(std::iter::repeat_n(0, suffix));
+                        let mut parts = Vec::new();
+                        crate::_byte_pair_merge_into(
+                            piece,
+                            &mut parts,
+                            |pair| *ranks.get(pair).unwrap_or(&Rank::MAX),
+                            |start, end| {
+                                *packed
+                                    .get_span(&document, prefix + start, prefix + end)
+                                    .unwrap_or(&Rank::MAX)
+                            },
+                        );
+                        let actual: Vec<_> = parts
+                            .windows(2)
+                            .map(|part| {
+                                *packed
+                                    .get_span(&document, prefix + part[0].0, prefix + part[1].0)
+                                    .unwrap()
+                            })
+                            .collect();
+                        assert_eq!(
+                            actual, expected,
+                            "seed={seed} length={length} prefix={prefix} suffix={suffix}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     fn core(pattern: &str) -> CoreBPE {
         let mut ranks: HashMap<Vec<u8>, Rank> = (0_u16..256)
