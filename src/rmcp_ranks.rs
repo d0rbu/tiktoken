@@ -51,11 +51,19 @@ fn short_key_window(source: &[u8], start: usize, length: usize) -> u64 {
     if length == 0 {
         return 0;
     }
-    let window = start.min(source.len() - 8);
-    let word = u64::from_le_bytes(source[window..window + 8].try_into().unwrap());
-    let shift = (start - window) * 8;
     let mask = (1_u64 << (length * 8)) - 1;
-    ((word >> shift) & mask) | ((length as u64) << 56)
+    let tag = (length as u64) << 56;
+    if start <= source.len() - 8 {
+        // The usual forward window needs neither a clamped address nor a
+        // variable right shift. The branch bounds the complete load.
+        let word = u64::from_le_bytes(source[start..start + 8].try_into().unwrap());
+        (word & mask) | tag
+    } else {
+        let window = source.len() - 8;
+        let word = u64::from_le_bytes(source[window..].try_into().unwrap());
+        let shift = (start - window) * 8;
+        ((word >> shift) & mask) | tag
+    }
 }
 
 #[repr(C)]
