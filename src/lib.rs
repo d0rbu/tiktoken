@@ -518,6 +518,7 @@ impl CoreBPE {
                         piece,
                         &mut parts,
                         |pair| self.pair_ranks[pair_index(pair[0], pair[1])],
+                        #[inline(always)]
                         |start, end| {
                             *self
                                 .encoder
