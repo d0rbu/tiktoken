@@ -151,3 +151,16 @@ Rust and Python regressions compare full-ID counts across Unicode boundaries,
 partial special policies, overlapping literals, incomplete vocabularies, invalid
 ranges, and empty registries. The RMCP consumer additionally qualifies the native
 binary against Hugging Face counts and exact public-selector artifacts.
+
+## RMCP independent prefix offsets
+
+The private `_encode_with_character_offsets_prefixes` binding returns complete
+ordinary token-ID and original character-offset lists for independent prefix ends
+in the supplied order. It returns through the first empty or over-limit prefix so
+the owning RMCP caller raises its original context-eligibility error first.
+
+For the exact guarded pattern it indexes complete pieces once and independently
+re-encodes each prefix's last two pieces at EOF. The same complete-byte vocabulary,
+full special-token policy, 64 KiB and amortized-work guards as range counting apply.
+Unsupported calls retain ordered scalar encoding, including native error behavior.
+No index or result is retained across calls; duplicate and unsorted ends are allowed.

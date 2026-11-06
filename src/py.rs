@@ -492,6 +492,22 @@ impl CoreBPE {
         })
     }
 
+    #[pyo3(name = "_encode_with_character_offsets_prefixes")]
+    fn py_encode_with_character_offsets_prefixes(
+        &self,
+        py: Python,
+        text: &str,
+        ends: Vec<usize>,
+        allowed_special: HashSet<PyBackedStr>,
+        max_tokens: usize,
+    ) -> PyResult<Vec<(Vec<Rank>, Vec<(usize, usize)>)>> {
+        py.detach(|| {
+            let allowed: HashSet<&str> = allowed_special.iter().map(|s| s.as_ref()).collect();
+            self.encode_with_character_offsets_prefixes(text, &ends, &allowed, max_tokens)
+                .map_err(|e| PyErr::new::<exceptions::PyValueError, _>(e.message))
+        })
+    }
+
     #[pyo3(name = "count_tokens")]
     fn py_count_tokens(
         &self,

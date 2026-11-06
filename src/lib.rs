@@ -445,11 +445,17 @@ impl CoreBPE {
         allowed_special: &HashSet<&str>,
     ) -> Result<(Vec<Rank>, Vec<(usize, usize)>), EncodeError> {
         let (tokens, _) = self.encode(text, allowed_special)?;
+        let offsets = self.character_offsets(text, &tokens);
+        Ok((tokens, offsets))
+    }
+
+    #[cfg(any(feature = "python", test))]
+    fn character_offsets(&self, text: &str, tokens: &[Rank]) -> Vec<(usize, usize)> {
         let mut character_starts = text.char_indices().map(|(byte, _)| byte).peekable();
         let mut character_end = 0;
         let mut byte_start = 0;
         let mut offsets = Vec::with_capacity(tokens.len());
-        for token in &tokens {
+        for token in tokens {
             let start = character_end - usize::from(!text.is_char_boundary(byte_start));
             let bytes = self
                 .special_tokens_decoder
@@ -464,7 +470,54 @@ impl CoreBPE {
             offsets.push((start, character_end));
             byte_start = byte_end;
         }
-        Ok((tokens, offsets))
+        offsets
+    }
+
+    /// Character-coordinate prefix ends; return through the first ineligible prefix.
+    #[cfg(any(feature = "python", test))]
+    fn encode_with_character_offsets_prefixes(
+        &self,
+        text: &str,
+        ends: &[usize],
+        allowed: &HashSet<&str>,
+        max_tokens: usize,
+    ) -> Result<Vec<(Vec<Rank>, Vec<(usize, usize)>)>, EncodeError> {
+        let boundaries: Vec<usize> = text
+            .char_indices()
+            .map(|(byte, _)| byte)
+            .chain([text.len()])
+            .collect();
+        let byte_ends: Option<Vec<usize>> = ends
+            .iter()
+            .map(|&end| boundaries.get(end).copied())
+            .collect();
+        if let Some(byte_ends) = byte_ends {
+            if let Some(rows) =
+                self.try_encode_prefixes_indexed(text, &byte_ends, allowed, max_tokens)
+            {
+                return Ok(rows
+                    .into_iter()
+                    .zip(byte_ends)
+                    .map(|(ids, end)| {
+                        let offsets = self.character_offsets(&text[..end], &ids);
+                        (ids, offsets)
+                    })
+                    .collect());
+            }
+        }
+        let mut rows = Vec::with_capacity(ends.len());
+        for &end in ends {
+            let byte = boundaries.get(end).ok_or_else(|| EncodeError {
+                message: "prefix end exceeds the original character bounds".to_owned(),
+            })?;
+            let row = self.encode_with_character_offsets(&text[..*byte], allowed)?;
+            let stop = row.0.is_empty() || row.0.len() > max_tokens;
+            rows.push(row);
+            if stop {
+                break;
+            }
+        }
+        Ok(rows)
     }
 
     /// Count tokens for complete byte vocabularies without materializing output IDs.
@@ -1172,9 +1225,7 @@ mod tests {
 
     #[test]
     fn character_offsets_cover_split_scalars_specials_and_empty_input() {
-        let ranks = (0u32..256)
-            .map(|byte| (vec![byte as u8], byte))
-            .collect();
+        let ranks = (0u32..256).map(|byte| (vec![byte as u8], byte)).collect();
         let model = crate::CoreBPE::new_internal(
             ranks,
             HashMap::from_iter([("<S>".to_owned(), 300)]),
