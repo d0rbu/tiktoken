@@ -500,12 +500,45 @@ impl CoreBPE {
         ends: Vec<usize>,
         allowed_special: HashSet<PyBackedStr>,
         max_tokens: usize,
-    ) -> PyResult<Vec<(Vec<Rank>, Vec<(usize, usize)>)>> {
-        py.detach(|| {
+    ) -> PyResult<Py<PyList>> {
+        let rows = py.detach(|| {
             let allowed: HashSet<&str> = allowed_special.iter().map(|s| s.as_ref()).collect();
             self.encode_with_character_offsets_prefixes(text, &ends, &allowed, max_tokens)
                 .map_err(|e| PyErr::new::<exceptions::PyValueError, _>(e.message))
-        })
+        })?;
+        let result = PyList::empty(py);
+        let mut previous: Option<(Bound<'_, PyList>, Bound<'_, PyList>)> = None;
+        for (index, (ids, offsets)) in rows.iter().enumerate() {
+            let common = index.checked_sub(1).map_or(0, |prior| {
+                ids.iter()
+                    .zip(offsets)
+                    .zip(rows[prior].0.iter().zip(&rows[prior].1))
+                    .take_while(|(left, right)| left == right)
+                    .count()
+            });
+            let (py_ids, py_offsets) = if let Some((prior_ids, prior_offsets)) =
+                previous.as_ref().filter(|_| common > 0)
+            {
+                // Slices own independent lists; only immutable integer/tuple values are shared.
+                let py_ids = prior_ids.get_slice(0, common);
+                let py_offsets = prior_offsets.get_slice(0, common);
+                for id in &ids[common..] {
+                    py_ids.append(*id)?;
+                }
+                for offset in &offsets[common..] {
+                    py_offsets.append(*offset)?;
+                }
+                (py_ids, py_offsets)
+            } else {
+                (
+                    PyList::new(py, ids.iter().copied())?,
+                    PyList::new(py, offsets.iter().copied())?,
+                )
+            };
+            result.append((&py_ids, &py_offsets))?;
+            previous = Some((py_ids, py_offsets));
+        }
+        Ok(result.unbind())
     }
 
     #[pyo3(name = "count_tokens")]

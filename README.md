@@ -31,6 +31,12 @@ byte length, so embedded or trailing zero bytes remain distinct. Longer keys kee
 their original byte-vector representation. This changes lookup storage only;
 token ranks, merge ordering, special tokens and decoding retain their meanings.
 
+RMCP prefix character-offset results remain ordinary, independently mutable Python
+lists. During one call, exact matching adjacent prefix entries can share only
+immutable Python integers and span tuples; the lists themselves remain separate.
+The native encoding, requested-prefix EOF and character-offset computations are
+unchanged, and no values are cached between calls.
+
 `tiktoken` is between 3-6x faster than a comparable open source tokeniser:
 
 ![image](https://raw.githubusercontent.com/openai/tiktoken/main/perf.svg)

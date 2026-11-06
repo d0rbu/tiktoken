@@ -103,6 +103,33 @@ def test_concurrent_results_are_independent():
     assert actual[1] == wanted
 
 
+@pytest.mark.parametrize("guarded", [True, False])
+def test_prefix_values_are_dense_independently_mutable_lists(guarded):
+    core, decoder, allowed = model(guarded)
+    text = "abc é😀 abc <S>long  \r\n" * 4
+    ends = [len(text), len(text), len(text) - 3, 1, len(text), 0]
+    wanted = reference(core, decoder, text, ends, allowed, 100000)
+    actual = core._encode_with_character_offsets_prefixes(text, ends, allowed, 100000)
+    assert actual == wanted
+    assert type(actual) is list
+    for ids, offsets in actual:
+        assert type(ids) is list and type(offsets) is list
+        assert all(type(value) is int for value in ids)
+        assert all(
+            type(span) is tuple and all(type(value) is int for value in span)
+            for span in offsets
+        )
+    assert all(type(row) is tuple for row in actual)
+    assert len({id(row[0]) for row in actual}) == len(actual)
+    assert len({id(row[1]) for row in actual}) == len(actual)
+    actual[0][0][0] = -1
+    actual[0][1][0] = (-1, -1)
+    actual[0][0].append(999)
+    actual[0][1].clear()
+    assert actual[1:] == wanted[1:]
+    assert core._encode_with_character_offsets_prefixes(text, ends, allowed, 100000) == wanted
+
+
 @pytest.mark.parametrize("size", [65536, 65537])
 def test_size_boundary_retains_independent_prefixes(size):
     core, decoder, allowed = model()
