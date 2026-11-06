@@ -1,3 +1,31 @@
+## Original character-offset projection (`0.14.0+rmcp.121.charoffset1`)
+
+The private `CoreBPE._encode_with_character_offsets(text, allowed_special)`
+returns ordinary Python ID and `(start, end)` character-offset lists for the
+RMCP owner's admitted complete byte vocabulary and full-input piece pattern.
+The existing scalar encoder still produces every token. A monotone UTF-8 scalar
+cursor projects each token's first and last bytes: a token splitting a scalar
+starts at that scalar and ends after it. Specials retain the caller's admitted
+ID/width mapping. Empty input returns two empty lists.
+
+This replaces the consumer's per-row NumPy byte, boundary and list intermediates.
+It does not change encoding, matching, allowed-special selection, count-only
+calls, model admission or postprocessing. Inputs and allowed specials use the
+scalar binding's extraction and encoding-error mapping; allocation failure timing
+is not promised identical. No offset cache, worker, alternate causal view or
+mutable shared state is added. Unsupported models and surrogate text remain the
+RMCP caller's original fallback responsibility.
+
+The separate four-pair real RewardBench2 screen processed all 11,028 originals /
+180,957 causal rows. Complete 184-file outputs (393,152,783 bytes per arm) and
+warnings matched. Median paired CPU/elapsed ratios were 0.88703/0.78254; every
+pair improved. A separate full-public-causal-view control had exact complete
+view hashes and CPU/elapsed medians 0.78389/0.78428. Both private builds used
+Rust/Cargo 1.90.0, Python 3.12.11 and the same release flags. These are selected
+shared-host screen results, not installed RMCP, universal elapsed, GPU or
+training throughput qualification. RMCP requires its own installed comparison
+and full integrated gate before adoption.
+
 ## Grouped direct storage decode candidate
 
 The direct 17-bit decoder now uses the generic storage decoder's existing

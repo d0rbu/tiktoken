@@ -437,6 +437,36 @@ impl CoreBPE {
             .map(|(tokens, last_piece, _)| (tokens, last_piece))
     }
 
+    /// Project encoded byte spans to original character spans for complete byte vocabularies.
+    #[cfg(any(feature = "python", test))]
+    fn encode_with_character_offsets(
+        &self,
+        text: &str,
+        allowed_special: &HashSet<&str>,
+    ) -> Result<(Vec<Rank>, Vec<(usize, usize)>), EncodeError> {
+        let (tokens, _) = self.encode(text, allowed_special)?;
+        let mut character_starts = text.char_indices().map(|(byte, _)| byte).peekable();
+        let mut character_end = 0;
+        let mut byte_start = 0;
+        let mut offsets = Vec::with_capacity(tokens.len());
+        for token in &tokens {
+            let start = character_end - usize::from(!text.is_char_boundary(byte_start));
+            let bytes = self
+                .special_tokens_decoder
+                .get(token)
+                .or_else(|| self.decoder.get(token))
+                .expect("encoded token has a decoder entry");
+            let byte_end = byte_start + bytes.len();
+            while character_starts.peek().is_some_and(|&byte| byte < byte_end) {
+                character_starts.next();
+                character_end += 1;
+            }
+            offsets.push((start, character_end));
+            byte_start = byte_end;
+        }
+        Ok((tokens, offsets))
+    }
+
     /// Count tokens for complete byte vocabularies without materializing output IDs.
     pub fn count_tokens(
         &self,
@@ -1139,6 +1169,31 @@ mod tests {
     use rustc_hash::FxHashMap as HashMap;
 
     use crate::{Rank, byte_pair_split};
+
+    #[test]
+    fn character_offsets_cover_split_scalars_specials_and_empty_input() {
+        let ranks = (0u32..256)
+            .map(|byte| (vec![byte as u8], byte))
+            .collect();
+        let model = crate::CoreBPE::new_internal(
+            ranks,
+            HashMap::from_iter([("<S>".to_owned(), 300)]),
+            r"[\s\S]+",
+        )
+        .unwrap();
+        let allowed = std::collections::HashSet::from(["<S>"]);
+        assert_eq!(
+            model.encode_with_character_offsets("", &allowed).unwrap(),
+            (vec![], vec![])
+        );
+        let text = "é<S>😀";
+        let (ids, offsets) = model.encode_with_character_offsets(text, &allowed).unwrap();
+        assert_eq!(ids, model.encode(text, &allowed).unwrap().0);
+        assert_eq!(
+            offsets,
+            vec![(0, 1), (0, 1), (1, 4), (4, 5), (4, 5), (4, 5), (4, 5)]
+        );
+    }
 
     fn setup_ranks() -> HashMap<Vec<u8>, Rank> {
         HashMap::from_iter([(b"ab".to_vec(), 0), (b"cd".to_vec(), 1)])
