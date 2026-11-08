@@ -541,6 +541,57 @@ impl CoreBPE {
         Ok(result.unbind())
     }
 
+    /// Project fresh prefix offsets to the target bounds consumed by causal rows.
+    /// The consumer retains its existing ordered length/nonempty-target checks.
+    #[pyo3(name = "_encode_with_character_targets_prefixes")]
+    fn py_encode_with_character_targets_prefixes(
+        &self,
+        py: Python,
+        text: &str,
+        spans: Vec<(usize, usize)>,
+        allowed_special: HashSet<PyBackedStr>,
+        max_tokens: usize,
+    ) -> PyResult<Py<PyList>> {
+        let rows = py.detach(|| {
+            let allowed: HashSet<&str> = allowed_special.iter().map(|s| s.as_ref()).collect();
+            let ends: Vec<usize> = spans.iter().map(|span| span.1).collect();
+            self.encode_with_character_offsets_prefixes(text, &ends, &allowed, max_tokens)
+                .map(|rows| {
+                    rows.into_iter()
+                        .zip(&spans)
+                        .map(|((ids, offsets), &(start, stop))| {
+                            let first = offsets.partition_point(|span| span.1 <= start);
+                            let last = offsets.partition_point(|span| span.0 < stop);
+                            (ids, first, last)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .map_err(|e| PyErr::new::<exceptions::PyValueError, _>(e.message))
+        })?;
+        let result = PyList::empty(py);
+        let mut previous: Option<Bound<'_, PyList>> = None;
+        for (index, (ids, first, last)) in rows.iter().enumerate() {
+            let common = index.checked_sub(1).map_or(0, |prior| {
+                ids.iter()
+                    .zip(&rows[prior].0)
+                    .take_while(|(left, right)| left == right)
+                    .count()
+            });
+            let py_ids = if let Some(prior) = previous.as_ref().filter(|_| common > 0) {
+                let values = prior.get_slice(0, common);
+                for id in &ids[common..] {
+                    values.append(*id)?;
+                }
+                values
+            } else {
+                PyList::new(py, ids.iter().copied())?
+            };
+            result.append((&py_ids, *first, *last))?;
+            previous = Some(py_ids);
+        }
+        Ok(result.unbind())
+    }
+
     #[pyo3(name = "count_tokens")]
     fn py_count_tokens(
         &self,

@@ -298,3 +298,30 @@ background tasks or persistent caches are added.
 ## Private model admission
 
 The RMCP-only model helpers retain the existing ordered vocabulary, merge, byte-alphabet, and proof-quota rules while running their loops in the extension. Public encoding and generic callback behavior stay the same. `tests/test_rmcp_model.py` exercises rejection, callback ordering, quotas, and byte conversion.
+
+## Consumed causal target bounds (`0.14.0+rmcp.123.targetprefixes1`)
+
+The private `_encode_with_character_targets_prefixes` method consumes ordered
+character target spans through the unchanged prefix encoder. It projects each
+fresh Rust offset vector to its first and last overlapping token indices before
+constructing Python results. Each result retains an independent mutable ID list;
+only immutable Python integers are shared across common prefixes. Full offset
+encoding and every public API remain unchanged. The consumer retains its original
+ordered prefix-length and nonempty-target checks.
+
+The complete native suites passed 70 release-mode Rust tests and 2,662 Python
+tests against the normally installed wheel. New scalar-offset oracles exercise
+Unicode, allowed-special policies, unsorted and repeated spans, size boundaries,
+first-error order, concurrency and independent mutable lists. The Python suite
+runs outside the source checkout, as installed-wheel tests require; the retained
+first invocation's two nested imports instead selected the unbuilt checkout.
+
+Combined with its RMCP caller, the fixed four-pair complete clean-token workload
+used 6.73% less CPU and 4.48% less wall time at median paired ratios. All four
+CPU and wall pairs improved, and all 184 output files and 180,957 ordered rows
+matched exactly. Both native arms were freshly built with Rust 1.90.0 and the
+same release flags. This shared-host comparison includes the caller and durable
+publication; it does not establish isolated native, storage or training speed.
+The excluded warmups were substantially slower. Original inputs and adverse
+evidence remain; all ten generated output trees were removed after parity.
+The RMCP lock update and complete repository gate remain required before adoption.
