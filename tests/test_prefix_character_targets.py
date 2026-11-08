@@ -1,5 +1,6 @@
 """Consumed target bounds match independent scalar offsets without Python offset lists."""
 
+import json
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -106,3 +107,39 @@ def test_existing_prefix_size_boundary(size):
     assert core._encode_with_character_targets_prefixes(
         text, spans, allowed, 100000
     ) == wanted(core, decoder, text, spans, allowed, 100000)
+
+
+@pytest.mark.parametrize("guarded", [True, False])
+@pytest.mark.parametrize("policy", ["all", "partial", "none"])
+@settings(max_examples=100, deadline=None)
+@given(text=st.text(st.characters(exclude_categories=("Cs",)), max_size=100))
+def test_json_targets_match_complete_scalar_ids_and_observed_metadata(text, guarded, policy):
+    core, decoder, allowed = model(guarded)
+    allowed = allowed if policy == "all" else frozenset({"<S>"}) if policy == "partial" else frozenset()
+    spans = [(max(0, end - 1), end) for end in range(len(text) + 1)]
+    spans += [(0, len(text)), (0, len(text)), (len(text) + 1, len(text))]
+    for order in (spans, list(reversed(spans))):
+        for limit in (0, 4, 100000):
+            expected = wanted(core, decoder, text, order, allowed, limit)
+            result = core._encode_with_character_targets_prefixes(text, order, allowed, limit, as_json=True)
+            assert [(json.loads(payload), first, last) for payload, count, first, last, maximum in result] == expected
+            for row, (ids, first, last) in zip(result, expected):
+                payload, count, _, _, maximum = row
+                assert type(payload) is bytes
+                assert payload == json.dumps(ids, separators=(",", ":")).encode()
+                assert count == len(ids)
+                assert maximum == max(ids, default=None)
+            assert core._encode_with_character_targets_prefixes(text, order, allowed, limit) == expected
+
+
+def test_json_target_guard_order_empty_and_reserved_actual_id():
+    from tiktoken import _tiktoken
+    core = _tiktoken.CoreBPE({bytes([value]): value for value in range(256)}, {"<S>": 100295}, r"[\s\S]+")
+    rows = core._encode_with_character_targets_prefixes("abc<S>d", [(0, 1), (1, 3), (3, 6), (6, 7)], frozenset({"<S>"}), 100, as_json=True)
+    assert [row[4] for row in rows] == [97, 99, 100295, 100295]
+    assert all(row[1] == len(json.loads(row[0])) and row[4] == max(json.loads(row[0])) for row in rows)
+    assert core._encode_with_character_targets_prefixes("a", [], frozenset(), 100, as_json=True) == []
+    with pytest.raises(ValueError, match="prefix end exceeds"):
+        core._encode_with_character_targets_prefixes("a", [(0, 2)], frozenset(), 100, as_json=True)
+    expected = wanted(core, {i: bytes([i]) for i in range(256)}, "abc", [(0, 1), (0, 999)], frozenset(), 0)
+    assert [(json.loads(row[0]),row[2],row[3]) for row in core._encode_with_character_targets_prefixes("abc", [(0, 1), (0, 999)], frozenset(), 0, as_json=True)] == expected
