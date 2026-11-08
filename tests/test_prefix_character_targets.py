@@ -106,3 +106,26 @@ def test_existing_prefix_size_boundary(size):
     assert core._encode_with_character_targets_prefixes(
         text, spans, allowed, 100000
     ) == wanted(core, decoder, text, spans, allowed, 100000)
+
+
+@pytest.mark.parametrize("guarded", [True, False])
+@settings(max_examples=150, deadline=None)
+@given(
+    text=st.text(st.characters(exclude_categories=("Cs",)), max_size=40),
+    data=st.data(),
+)
+def test_arbitrary_target_starts_and_unsorted_prefixes(text, data, guarded):
+    core, decoder, allowed = model(guarded)
+    spans = data.draw(
+        st.lists(
+            st.tuples(
+                st.integers(min_value=0, max_value=len(text) + 10),
+                st.integers(min_value=0, max_value=len(text)),
+            ),
+            max_size=20,
+        )
+    )
+    limit = data.draw(st.integers(min_value=0, max_value=200))
+    assert core._encode_with_character_targets_prefixes(
+        text, spans, allowed, limit
+    ) == wanted(core, decoder, text, spans, allowed, limit)

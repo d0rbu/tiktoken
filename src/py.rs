@@ -554,18 +554,7 @@ impl CoreBPE {
     ) -> PyResult<Py<PyList>> {
         let rows = py.detach(|| {
             let allowed: HashSet<&str> = allowed_special.iter().map(|s| s.as_ref()).collect();
-            let ends: Vec<usize> = spans.iter().map(|span| span.1).collect();
-            self.encode_with_character_offsets_prefixes(text, &ends, &allowed, max_tokens)
-                .map(|rows| {
-                    rows.into_iter()
-                        .zip(&spans)
-                        .map(|((ids, offsets), &(start, stop))| {
-                            let first = offsets.partition_point(|span| span.1 <= start);
-                            let last = offsets.partition_point(|span| span.0 < stop);
-                            (ids, first, last)
-                        })
-                        .collect::<Vec<_>>()
-                })
+            self.encode_with_character_targets_prefixes(text, &spans, &allowed, max_tokens)
                 .map_err(|e| PyErr::new::<exceptions::PyValueError, _>(e.message))
         })?;
         let result = PyList::empty(py);

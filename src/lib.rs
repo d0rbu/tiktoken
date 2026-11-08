@@ -520,6 +520,98 @@ impl CoreBPE {
         Ok(rows)
     }
 
+    /// Consumed overlap bounds can use byte coordinates without offset vectors.
+    #[cfg(any(feature = "python", test))]
+    fn character_target_bounds(
+        &self,
+        text: &str,
+        tokens: &[Rank],
+        start: usize,
+        stop: usize,
+        start_byte: usize,
+    ) -> (usize, usize) {
+        let mut byte_start = 0;
+        let mut first = 0;
+        let mut last = 0;
+        for token in tokens {
+            let bytes = self
+                .special_tokens_decoder
+                .get(token)
+                .or_else(|| self.decoder.get(token))
+                .expect("encoded token has a decoder entry");
+            let byte_end = byte_start + bytes.len();
+            first += usize::from(byte_end <= start_byte);
+            last += usize::from(byte_start < text.len());
+            byte_start = byte_end;
+        }
+        if byte_start == text.len() {
+            return (first, last);
+        }
+        // Unusual decoder aliases retain the original character projection.
+        let offsets = self.character_offsets(text, tokens);
+        (
+            offsets.partition_point(|span| span.1 <= start),
+            offsets.partition_point(|span| span.0 < stop),
+        )
+    }
+
+    #[cfg(any(feature = "python", test))]
+    fn encode_with_character_targets_prefixes(
+        &self,
+        text: &str,
+        spans: &[(usize, usize)],
+        allowed: &HashSet<&str>,
+        max_tokens: usize,
+    ) -> Result<Vec<(Vec<Rank>, usize, usize)>, EncodeError> {
+        let boundaries: Vec<usize> = text
+            .char_indices()
+            .map(|(byte, _)| byte)
+            .chain([text.len()])
+            .collect();
+        let byte_ends: Option<Vec<usize>> = spans
+            .iter()
+            .map(|&(_, end)| boundaries.get(end).copied())
+            .collect();
+        if let Some(byte_ends) = byte_ends {
+            if let Some(rows) =
+                self.try_encode_prefixes_indexed(text, &byte_ends, allowed, max_tokens)
+            {
+                return Ok(rows
+                    .into_iter()
+                    .zip(spans)
+                    .zip(byte_ends)
+                    .map(|((ids, &(start, stop)), byte_end)| {
+                        let start_byte = boundaries.get(start).copied().unwrap_or(usize::MAX);
+                        let (first, last) = self.character_target_bounds(
+                            &text[..byte_end],
+                            &ids,
+                            start,
+                            stop,
+                            start_byte,
+                        );
+                        (ids, first, last)
+                    })
+                    .collect());
+            }
+        }
+        let mut rows = Vec::with_capacity(spans.len());
+        for &(start, stop) in spans {
+            let byte_end = *boundaries.get(stop).ok_or_else(|| EncodeError {
+                message: "prefix end exceeds the original character bounds".to_owned(),
+            })?;
+            let ids = self.encode(&text[..byte_end], allowed)?.0;
+            let ineligible = ids.is_empty() || ids.len() > max_tokens;
+            let start_byte = boundaries.get(start).copied().unwrap_or(usize::MAX);
+            let (first, last) =
+                self.character_target_bounds(&text[..byte_end], &ids, start, stop, start_byte);
+            rows.push((ids, first, last));
+            if ineligible {
+                break;
+            }
+        }
+        Ok(rows)
+    }
+
     /// Count tokens for complete byte vocabularies without materializing output IDs.
     pub fn count_tokens(
         &self,

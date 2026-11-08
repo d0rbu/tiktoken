@@ -325,3 +325,18 @@ publication; it does not establish isolated native, storage or training speed.
 The excluded warmups were substantially slower. Original inputs and adverse
 evidence remain; all ten generated output trees were removed after parity.
 The RMCP lock update and complete repository gate remain required before adoption.
+
+
+## Causal byte-boundary projection
+
+Version `0.14.0+rmcp.124.bytetargets1` keeps the existing independent-prefix
+encoding and Python target API. Its consumed first/last bounds use the decoded
+token byte lengths and shared original character boundaries, avoiding full Rust
+character-offset vectors. Unicode byte splits use the original overlap rule.
+Non-roundtripping decoder aliases retain the original character projection.
+
+The scalar-offset reference remains the independent oracle, including empty,
+unsorted and duplicate prefixes, arbitrary target starts, allowed-special policies,
+ordered first-invalid-prefix behavior and concurrent independent mutable outputs.
+Component tests do not establish complete RMCP preparation speed or parity; those
+require the retained full-workload comparison and project gate.
