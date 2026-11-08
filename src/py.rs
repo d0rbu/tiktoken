@@ -544,6 +544,7 @@ impl CoreBPE {
     /// Project fresh prefix offsets to the target bounds consumed by causal rows.
     /// The consumer retains its existing ordered length/nonempty-target checks.
     #[pyo3(name = "_encode_with_character_targets_prefixes")]
+    #[pyo3(signature = (text, spans, allowed_special, max_tokens, *, as_json=false))]
     fn py_encode_with_character_targets_prefixes(
         &self,
         py: Python,
@@ -551,6 +552,7 @@ impl CoreBPE {
         spans: Vec<(usize, usize)>,
         allowed_special: HashSet<PyBackedStr>,
         max_tokens: usize,
+        as_json: bool,
     ) -> PyResult<Py<PyList>> {
         let rows = py.detach(|| {
             let allowed: HashSet<&str> = allowed_special.iter().map(|s| s.as_ref()).collect();
@@ -571,6 +573,19 @@ impl CoreBPE {
         let result = PyList::empty(py);
         let mut previous: Option<Bound<'_, PyList>> = None;
         for (index, (ids, first, last)) in rows.iter().enumerate() {
+            if as_json {
+                let payload = py
+                    .detach(|| serde_json::to_vec(ids))
+                    .map_err(|error| exceptions::PyValueError::new_err(error.to_string()))?;
+                result.append((
+                    PyBytes::new(py, &payload),
+                    ids.len(),
+                    *first,
+                    *last,
+                    ids.iter().copied().max(),
+                ))?;
+                continue;
+            }
             let common = index.checked_sub(1).map_or(0, |prior| {
                 ids.iter()
                     .zip(&rows[prior].0)
