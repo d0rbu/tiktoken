@@ -1,3 +1,16 @@
+## Immutable consumed causal IDs candidate (`0.14.0+rmcp.124.immutabletargets1`)
+
+The separate private `_encode_with_character_targets_prefixes_immutable` endpoint
+retains the existing independent prefix encoder, character-offset projection and
+target indices. It constructs each ID tuple directly, sharing only immutable
+integer objects from the preceding prefix, so the clean-token consumer need not
+copy an intermediate ID list. The original mutable-list endpoint, its independent
+list ownership, offsets API, error order and scalar fallbacks are unchanged.
+No byte-projection candidate is included. Native property/concurrency controls
+compare both endpoints with independently encoded scalar offsets. Correctness
+controls do not establish performance; an installed complete RMCP workload screen
+must qualify the candidate separately before adoption.
+
 ## Original character-offset projection (`0.14.0+rmcp.121.charoffset1`)
 
 The private `CoreBPE._encode_with_character_offsets(text, allowed_special)`

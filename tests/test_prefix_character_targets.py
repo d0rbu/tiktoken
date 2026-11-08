@@ -106,3 +106,81 @@ def test_existing_prefix_size_boundary(size):
     assert core._encode_with_character_targets_prefixes(
         text, spans, allowed, 100000
     ) == wanted(core, decoder, text, spans, allowed, 100000)
+
+
+@pytest.mark.parametrize("guarded", [True, False])
+@pytest.mark.parametrize("policy", ["all", "partial", "none"])
+@settings(max_examples=150, deadline=None)
+@given(
+    text=st.text(st.characters(exclude_categories=("Cs",)), max_size=60),
+    data=st.data(),
+)
+def test_immutable_targets_match_independent_scalar_offsets(
+    text, data, guarded, policy
+):
+    core, decoder, allowed = model(guarded)
+    allowed = (
+        allowed
+        if policy == "all"
+        else frozenset({"<S>"})
+        if policy == "partial"
+        else frozenset()
+    )
+    spans = data.draw(
+        st.lists(
+            st.tuples(
+                st.integers(min_value=0, max_value=len(text) + 4),
+                st.integers(min_value=0, max_value=len(text)),
+            ),
+            max_size=20,
+        )
+    )
+    limit = data.draw(st.integers(min_value=0, max_value=1000))
+    expected = [
+        (tuple(ids), first, last)
+        for ids, first, last in wanted(core, decoder, text, spans, allowed, limit)
+    ]
+    actual = core._encode_with_character_targets_prefixes_immutable(
+        text, spans, allowed, limit
+    )
+    assert actual == expected
+    assert type(actual) is list
+    assert all(type(row) is tuple and type(row[0]) is tuple for row in actual)
+
+
+@pytest.mark.parametrize("guarded", [True, False])
+def test_immutable_targets_keep_ordered_errors_and_separate_mutable_api(guarded):
+    core, decoder, allowed = model(guarded)
+    text = "aéS😀 abc<S>long  \n" * 3
+    spans = [(0, len(text)), (1, len(text)), (0, 1), (3, len(text))]
+    expected = [
+        (tuple(ids), first, last)
+        for ids, first, last in wanted(core, decoder, text, spans, allowed, 100000)
+    ]
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(
+            pool.map(
+                lambda _: core._encode_with_character_targets_prefixes_immutable(
+                    text, spans, allowed, 100000
+                ),
+                range(16),
+            )
+        )
+    assert results == [expected] * 16
+    mutable = core._encode_with_character_targets_prefixes(text, spans, allowed, 100000)
+    mutable[0][0].clear()
+    assert results == [expected] * 16
+    expected_first = [
+        (tuple(ids), first, last)
+        for ids, first, last in wanted(core, decoder, "abc", [(0, 1)], allowed, 0)
+    ]
+    assert (
+        core._encode_with_character_targets_prefixes_immutable(
+            "abc", [(0, 1), (0, 999)], allowed, 0
+        )
+        == expected_first
+    )
+    with pytest.raises(ValueError, match="prefix end exceeds"):
+        core._encode_with_character_targets_prefixes_immutable(
+            "abc", [(0, 999)], allowed, 100000
+        )

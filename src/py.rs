@@ -4,7 +4,7 @@ use pyo3::{
     IntoPyObjectExt, PyResult, exceptions,
     prelude::*,
     pybacked::PyBackedStr,
-    types::{PyBytes, PyList},
+    types::{PyBytes, PyList, PyTuple},
 };
 use rustc_hash::FxHashMap as HashMap;
 
@@ -586,6 +586,60 @@ impl CoreBPE {
             } else {
                 PyList::new(py, ids.iter().copied())?
             };
+            result.append((&py_ids, *first, *last))?;
+            previous = Some(py_ids);
+        }
+        Ok(result.unbind())
+    }
+
+    /// Immutable IDs for a consumer that otherwise immediately copies each list.
+    /// The independent prefix/offset algorithm and mutable endpoint stay unchanged.
+    #[pyo3(name = "_encode_with_character_targets_prefixes_immutable")]
+    fn py_encode_with_character_targets_prefixes_immutable(
+        &self,
+        py: Python,
+        text: &str,
+        spans: Vec<(usize, usize)>,
+        allowed_special: HashSet<PyBackedStr>,
+        max_tokens: usize,
+    ) -> PyResult<Py<PyList>> {
+        let rows = py.detach(|| {
+            let allowed: HashSet<&str> = allowed_special.iter().map(|s| s.as_ref()).collect();
+            let ends: Vec<usize> = spans.iter().map(|span| span.1).collect();
+            self.encode_with_character_offsets_prefixes(text, &ends, &allowed, max_tokens)
+                .map(|rows| {
+                    rows.into_iter()
+                        .zip(&spans)
+                        .map(|((ids, offsets), &(start, stop))| {
+                            let first = offsets.partition_point(|span| span.1 <= start);
+                            let last = offsets.partition_point(|span| span.0 < stop);
+                            (ids, first, last)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .map_err(|e| PyErr::new::<exceptions::PyValueError, _>(e.message))
+        })?;
+        let result = PyList::empty(py);
+        let mut previous: Option<Bound<'_, PyTuple>> = None;
+        for (index, (ids, first, last)) in rows.iter().enumerate() {
+            let common = index.checked_sub(1).map_or(0, |prior| {
+                ids.iter()
+                    .zip(&rows[prior].0)
+                    .take_while(|(left, right)| left == right)
+                    .count()
+            });
+            let mut prior = previous.as_ref().map(|values| values.iter());
+            let py_ids = PyTuple::new(
+                py,
+                ids.iter().enumerate().map(|(position, id)| {
+                    if position < common {
+                        // `common` is bounded by both prior and current ID lengths.
+                        prior.as_mut().unwrap().next().unwrap()
+                    } else {
+                        id.into_pyobject(py).unwrap().into_any()
+                    }
+                }),
+            )?;
             result.append((&py_ids, *first, *last))?;
             previous = Some(py_ids);
         }
