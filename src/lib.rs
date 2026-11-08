@@ -497,17 +497,21 @@ impl CoreBPE {
             {
                 let mut projected: Vec<(Vec<Rank>, Vec<(usize, usize)>)> =
                     Vec::with_capacity(rows.len());
-                let mut byte_ends = Vec::<usize>::new();
-                for ids in rows {
+                let mut decoded_ends = Vec::<usize>::new();
+                for (ids, end) in rows.into_iter().zip(byte_ends) {
                     let common = projected.last().map_or(0, |(previous, _)| {
-                        ids.iter().zip(previous).take_while(|(a, b)| a == b).count()
+                        ids.iter()
+                            .zip(previous)
+                            .take_while(|(a, b)| a == b)
+                            .count()
+                            .min(decoded_ends.len())
                     });
                     let mut offsets = Vec::with_capacity(ids.len());
                     if let Some((_, previous)) = projected.last() {
                         offsets.extend_from_slice(&previous[..common]);
                     }
-                    byte_ends.truncate(common);
-                    let mut byte_start = byte_ends.last().copied().unwrap_or(0);
+                    decoded_ends.truncate(common);
+                    let mut byte_start = decoded_ends.last().copied().unwrap_or(0);
                     let mut character_end = offsets.last().map_or(0, |span| span.1);
                     // Each row encodes a prefix of this same text. Equal initial IDs
                     // have equal decoded bytes and character spans, even when a
@@ -521,11 +525,20 @@ impl CoreBPE {
                             .or_else(|| self.decoder.get(token))
                             .expect("encoded token has a decoder entry");
                         let byte_end = byte_start + bytes.len();
+                        // CoreBPE also accepts ordinary/special ID aliases. Its
+                        // scalar offset API caps an oversized decoded span at
+                        // this row's EOF; retain that result and reuse no capped
+                        // offsets in the next row.
+                        if byte_end > end {
+                            offsets = self.character_offsets(&text[..end], &ids);
+                            decoded_ends.clear();
+                            break;
+                        }
                         while boundaries[character_end] < byte_end {
                             character_end += 1;
                         }
                         offsets.push((start, character_end));
-                        byte_ends.push(byte_end);
+                        decoded_ends.push(byte_end);
                         byte_start = byte_end;
                     }
                     projected.push((ids, offsets));

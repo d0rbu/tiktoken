@@ -178,3 +178,24 @@ def test_reused_offsets_match_independent_prefixes_with_backtracking(text, data,
          sum(begin < stop for begin, _ in offsets))
         for (ids, offsets), (start, stop) in zip(wanted, spans)
     ]
+
+
+@pytest.mark.parametrize("special", ["XXXXXXXX", "é界😀", "X"])
+@pytest.mark.parametrize("text", ["a a", "a b a c", "😀a a\r\n", "a" * 80])
+def test_special_id_alias_retains_scalar_eof_capping(special, text):
+    ranks = {bytes([value]): value for value in range(256)}
+    pattern = (Path(__file__).parents[1] / "src/rmcp_pattern.txt").read_text()
+    core = _tiktoken.CoreBPE(ranks, {special: 97}, pattern)
+    allowed = frozenset({special})
+    ends = list(range(1, len(text) + 1)) + [len(text), 1, len(text)]
+    wanted = [core._encode_with_character_offsets(text[:end], allowed) for end in ends]
+    assert core._encode_with_character_offsets_prefixes(text, ends, allowed, 100000) == wanted
+    spans = [(0, end) for end in ends]
+    # Alias offsets can be nonmonotone after scalar EOF capping. Preserve the
+    # original target API's partition search, rather than imposing a new linear
+    # projection. This unmatched pattern forces its unchanged scalar path; with
+    # a byte-only vocabulary its ordinary partitioning gives the same IDs.
+    scalar = _tiktoken.CoreBPE(ranks, {special: 97}, r"[\s\S]+")
+    assert core._encode_with_character_targets_prefixes(text, spans, allowed, 100000) == (
+        scalar._encode_with_character_targets_prefixes(text, spans, allowed, 100000)
+    )
