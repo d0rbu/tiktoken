@@ -152,3 +152,29 @@ def test_partial_vocabulary_preserves_first_error_and_limit_order():
     with pytest.raises(type(scalar.value)) as actual:
         core._encode_with_character_offsets_prefixes("a!", [1, 2, 999], allowed, 100)
     assert str(actual.value) == str(scalar.value)
+
+
+@pytest.mark.parametrize("policy", ["all", "partial", "none"])
+@settings(max_examples=200, deadline=None)
+@given(
+    text=st.text(
+        alphabet=st.sampled_from(("a", "b", "c", "é", "界", "😀", " ", "\r", "\n", "<", "S", ">", "'")),
+        min_size=1, max_size=180,
+    ),
+    data=st.data(),
+)
+def test_reused_offsets_match_independent_prefixes_with_backtracking(text, data, policy):
+    core, decoder, registered = model()
+    allowed = registered if policy == "all" else frozenset({"<S>"}) if policy == "partial" else frozenset()
+    ends = data.draw(st.lists(st.integers(min_value=1, max_value=len(text)), min_size=2, max_size=24))
+    ends += [len(text), max(1, len(text) // 2), len(text), len(text)]
+    wanted = reference(core, decoder, text, ends, allowed, 100000)
+    actual = core._encode_with_character_offsets_prefixes(text, ends, allowed, 100000)
+    assert actual == wanted
+    spans = [(max(0, end - 3), end) for end in ends]
+    targets = core._encode_with_character_targets_prefixes(text, spans, allowed, 100000)
+    assert targets == [
+        (ids, next((i for i, (_, end) in enumerate(offsets) if end > start), len(offsets)),
+         sum(begin < stop for begin, _ in offsets))
+        for (ids, offsets), (start, stop) in zip(wanted, spans)
+    ]
