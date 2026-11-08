@@ -361,6 +361,7 @@ pub struct CoreBPE {
     special_tokens_encoder: HashMap<String, Rank>,
     decoder: HashMap<Rank, Vec<u8>>,
     special_tokens_decoder: HashMap<Rank, Vec<u8>>,
+    exact_target_decoder: bool,
     regex_tls: Vec<Regex>,
     regular_regex_tls: Option<Vec<rmcp_regex::RegularRegex>>,
     special_regex_tls: Vec<Regex>,
@@ -518,6 +519,128 @@ impl CoreBPE {
             }
         }
         Ok(rows)
+    }
+
+    /// Project only the two consumed target bounds, without allocating every offset.
+    #[cfg(any(feature = "python", test))]
+    fn encode_with_character_targets_prefixes(
+        &self,
+        text: &str,
+        spans: &[(usize, usize)],
+        allowed: &HashSet<&str>,
+        max_tokens: usize,
+    ) -> Result<Vec<(Vec<Rank>, usize, usize)>, EncodeError> {
+        let boundaries: Vec<usize> = text
+            .char_indices()
+            .map(|(byte, _)| byte)
+            .chain([text.len()])
+            .collect();
+        let byte_ends: Option<Vec<usize>> = spans
+            .iter()
+            .map(|&(_, end)| boundaries.get(end).copied())
+            .collect();
+        let project = |ids: Vec<Rank>, index: usize, byte_end: usize| {
+            let (start, stop) = spans[index];
+            let byte_start = boundaries.get(start).copied().unwrap_or(usize::MAX);
+            let (first, last) = self.character_target_bounds(
+                &text[..byte_end],
+                &ids,
+                (start, stop),
+                (byte_start, byte_end),
+            );
+            (ids, first, last)
+        };
+        if let Some(byte_ends) = byte_ends {
+            if let Some(rows) =
+                self.try_encode_prefixes_indexed(text, &byte_ends, allowed, max_tokens)
+            {
+                return Ok(rows
+                    .into_iter()
+                    .zip(byte_ends)
+                    .enumerate()
+                    .map(|(index, (ids, end))| {
+                        if self.exact_target_decoder {
+                            // The guarded index covers every prefix byte. Exact
+                            // decoder IDs end at `end`, so visit only the target suffix.
+                            let start = boundaries
+                                .get(spans[index].0)
+                                .copied()
+                                .unwrap_or(usize::MAX);
+                            let first = self.character_target_suffix_start(&ids, start, end);
+                            let last = ids.len();
+                            (ids, first, last)
+                        } else {
+                            project(ids, index, end)
+                        }
+                    })
+                    .collect());
+            }
+        }
+        let mut rows = Vec::with_capacity(spans.len());
+        for (index, &(_, end)) in spans.iter().enumerate() {
+            let byte_end = boundaries.get(end).ok_or_else(|| EncodeError {
+                message: "prefix end exceeds the original character bounds".to_owned(),
+            })?;
+            let ids = self.encode(&text[..*byte_end], allowed)?.0;
+            let stop = ids.is_empty() || ids.len() > max_tokens;
+            rows.push(project(ids, index, *byte_end));
+            if stop {
+                break;
+            }
+        }
+        Ok(rows)
+    }
+
+    #[cfg(any(feature = "python", test))]
+    fn character_target_suffix_start(&self, ids: &[Rank], start: usize, mut end: usize) -> usize {
+        let mut first = ids.len();
+        for (index, token) in ids.iter().enumerate().rev() {
+            if end <= start {
+                break;
+            }
+            let bytes = self
+                .special_tokens_decoder
+                .get(token)
+                .or_else(|| self.decoder.get(token))
+                .expect("encoded token has a decoder entry");
+            end -= bytes.len();
+            first = index;
+        }
+        first
+    }
+
+    #[cfg(any(feature = "python", test))]
+    fn character_target_bounds(
+        &self,
+        text: &str,
+        ids: &[Rank],
+        (start, stop): (usize, usize),
+        (byte_start, byte_stop): (usize, usize),
+    ) -> (usize, usize) {
+        let mut cursor = 0;
+        let mut first = 0;
+        let mut last = 0;
+        for token in ids {
+            let bytes = self
+                .special_tokens_decoder
+                .get(token)
+                .or_else(|| self.decoder.get(token))
+                .expect("encoded token has a decoder entry");
+            let end = cursor + bytes.len();
+            if end > text.len() {
+                // Public CoreBPE permits special IDs aliasing ordinary IDs. Their
+                // decoder lengths can exceed this prefix; preserve scalar semantics.
+                let offsets = self.character_offsets(text, ids);
+                return (
+                    offsets.partition_point(|span| span.1 <= start),
+                    offsets.partition_point(|span| span.0 < stop),
+                );
+            }
+            first += usize::from(end <= byte_start);
+            last += usize::from(cursor < byte_stop);
+            cursor = end;
+        }
+        (first, last)
     }
 
     /// Count tokens for complete byte vocabularies without materializing output IDs.
@@ -866,6 +989,13 @@ impl CoreBPE {
             .map(|(k, v)| (*v, k.as_bytes().to_vec()))
             .collect();
 
+        // Aliased IDs retain scalar offset semantics. Only exact decoders can
+        // infer the final byte position of an indexed prefix without rescanning.
+        let exact_target_decoder = special_tokens_encoder.iter().all(|(literal, rank)| {
+            !decoder.contains_key(rank)
+                && special_tokens_decoder[rank].as_slice() == literal.as_bytes()
+        });
+
         // Clone because I don't know how to tell Rust I'm not going to change the map
         let mut sorted_token_bytes: Vec<Vec<u8>> = encoder.keys().cloned().collect();
         sorted_token_bytes.sort();
@@ -885,6 +1015,7 @@ impl CoreBPE {
             special_tokens_encoder,
             decoder,
             special_tokens_decoder,
+            exact_target_decoder,
             regex_tls: (0..MAX_NUM_THREADS).map(|_| regex.clone()).collect(),
             regular_regex_tls: regular_regex
                 .map(|regex| (0..MAX_NUM_THREADS).map(|_| regex.clone()).collect()),
@@ -1222,6 +1353,84 @@ mod tests {
     use rustc_hash::FxHashMap as HashMap;
 
     use crate::{Rank, byte_pair_split};
+
+    #[test]
+    fn indexed_target_suffixes_preserve_exact_and_aliased_decoders() {
+        for selection in 0..3 {
+            let specials = match selection {
+                0 => HashMap::from_iter([("<S>".to_owned(), 300)]),
+                1 => HashMap::from_iter([("<S>".to_owned(), 97)]),
+                _ => HashMap::from_iter([("<S>".to_owned(), 300), ("other".to_owned(), 300)]),
+            };
+            let model = crate::CoreBPE::new_internal(
+                (0u32..256).map(|byte| (vec![byte as u8], byte)).collect(),
+                specials,
+                include_str!("rmcp_pattern.txt"),
+            )
+            .unwrap();
+            assert_eq!(model.exact_target_decoder, selection == 0);
+            let text = "aaa<S>other é😀 a\r\n";
+            let allowed = model.special_tokens();
+            let spans: Vec<_> = (1..=text.chars().count())
+                .flat_map(|end| [0, end - 1, end, end + 1].map(|start| (start, end)))
+                .collect();
+            let ends: Vec<_> = spans.iter().map(|span| span.1).collect();
+            let expected = model
+                .encode_with_character_offsets_prefixes(text, &ends, &allowed, usize::MAX)
+                .unwrap();
+            let actual = model
+                .encode_with_character_targets_prefixes(text, &spans, &allowed, usize::MAX)
+                .unwrap();
+            for ((ids, first, last), ((old_ids, offsets), &(start, stop))) in
+                actual.into_iter().zip(expected.into_iter().zip(&spans))
+            {
+                assert_eq!(ids, old_ids);
+                assert_eq!(first, offsets.partition_point(|span| span.1 <= start));
+                assert_eq!(last, offsets.partition_point(|span| span.0 < stop));
+            }
+        }
+    }
+
+    #[test]
+    fn direct_target_bounds_preserve_unicode_empty_and_decoder_aliases() {
+        for special in ["<S>", "a", ""] {
+            let ranks = (0u32..256).map(|byte| (vec![byte as u8], byte)).collect();
+            let model = crate::CoreBPE::new_internal(
+                ranks,
+                HashMap::from_iter([(special.to_owned(), 97)]),
+                r"[\s\S]+",
+            )
+            .unwrap();
+            for text in ["", "a", "aaaa", "é😀a", "aéa😀a"] {
+                let ids = model.encode_ordinary(text);
+                let offsets = model.character_offsets(text, &ids);
+                let boundaries: Vec<usize> = text
+                    .char_indices()
+                    .map(|(byte, _)| byte)
+                    .chain([text.len()])
+                    .collect();
+                let stop = text.chars().count();
+                for start in 0..stop + 3 {
+                    assert_eq!(
+                        model.character_target_bounds(
+                            text,
+                            &ids,
+                            (start, stop),
+                            (
+                                boundaries.get(start).copied().unwrap_or(usize::MAX),
+                                text.len(),
+                            ),
+                        ),
+                        (
+                            offsets.partition_point(|span| span.1 <= start),
+                            offsets.partition_point(|span| span.0 < stop),
+                        ),
+                        "special={special:?},text={text:?},start={start}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn character_offsets_cover_split_scalars_specials_and_empty_input() {

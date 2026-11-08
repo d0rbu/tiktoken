@@ -143,3 +143,48 @@ def test_json_target_guard_order_empty_and_reserved_actual_id():
         core._encode_with_character_targets_prefixes("a", [(0, 2)], frozenset(), 100, as_json=True)
     expected = wanted(core, {i: bytes([i]) for i in range(256)}, "abc", [(0, 1), (0, 999)], frozenset(), 0)
     assert [(json.loads(row[0]),row[2],row[3]) for row in core._encode_with_character_targets_prefixes("abc", [(0, 1), (0, 999)], frozenset(), 0, as_json=True)] == expected
+
+
+@pytest.mark.parametrize(
+    "special,text,spans,expected",
+    [
+        ("<S>", "aaa", [(3, 3)], [([97, 97, 97], 3, 1)]),
+        ("<S>", "aéa😀a", [(6, 5)], [([97, 195, 169, 97, 240, 159, 152, 128, 97], 9, 9)]),
+        ("<S>", "aaaa", [(0, 3), (3, 3), (0, 4)],
+         [([97, 97, 97], 0, 1), ([97, 97, 97], 3, 1), ([97, 97, 97, 97], 0, 4)]),
+        ("a", "aéa😀a", [(0, 5), (3, 5)],
+         [([97, 195, 169, 97, 240, 159, 152, 128, 97], 0, 9),
+          ([97, 195, 169, 97, 240, 159, 152, 128, 97], 4, 9)]),
+    ],
+)
+def test_direct_targets_keep_original_decoder_alias_geometry(special, text, spans, expected):
+    from tiktoken import _tiktoken
+
+    core = _tiktoken.CoreBPE(
+        {bytes([value]): value for value in range(256)}, {special: 97}, r"[\s\S]+"
+    )
+    # Captured from prechange 126: aliased decoder spans can be nonmonotone,
+    # so preserve the original Rust partition_point result rather than linear counts.
+    for as_json in (False, True):
+        actual = core._encode_with_character_targets_prefixes(
+            text, spans, frozenset(), 100000, as_json=as_json
+        )
+        if as_json:
+            actual = [(json.loads(row[0]), row[2], row[3]) for row in actual]
+        assert actual == expected
+
+
+@pytest.mark.parametrize("guarded", [True, False])
+@pytest.mark.parametrize("limit", [0, 1, 7, 100000])
+def test_suffix_projection_matches_full_offsets_for_every_start(guarded, limit):
+    core, decoder, allowed = model(guarded)
+    text = "aé😀 ababa<S>long\0 \r\n" * 4
+    spans = [(start, end) for end in range(len(text) + 1)
+             for start in (0, max(0, end - 1), end, end + 1, len(text) + 2)]
+    for ordered in (spans, list(reversed(spans))):
+        actual = core._encode_with_character_targets_prefixes(text, ordered, allowed, limit)
+        assert actual == wanted(core, decoder, text, ordered, allowed, limit)
+        assert core._encode_with_character_targets_prefixes(
+            text, ordered, allowed, limit, as_json=True
+        ) == [(json.dumps(ids, separators=(",", ":")).encode(), len(ids), first, last,
+               max(ids, default=None)) for ids, first, last in actual]
