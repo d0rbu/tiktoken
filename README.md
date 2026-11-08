@@ -37,6 +37,12 @@ immutable Python integers and span tuples; the lists themselves remain separate.
 The native encoding, requested-prefix EOF and character-offset computations are
 unchanged, and no values are cached between calls.
 
+The private `_causal_token_summary` operation uses the same encoder and allowed
+special tokens as `CoreBPE.encode`. It returns the exact ID count, EOS-ID
+occurrence count and whether the final ID equals EOS, including ordinary/special
+ID aliases. This avoids constructing a Python ID list for those eligibility facts;
+it changes neither encoding decisions nor any public ID-returning operation.
+
 `tiktoken` is between 3-6x faster than a comparable open source tokeniser:
 
 ![image](https://raw.githubusercontent.com/openai/tiktoken/main/perf.svg)
