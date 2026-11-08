@@ -477,6 +477,29 @@ impl CoreBPE {
         })
     }
 
+    /// Summarize the original IDs without materializing their Python list.
+    #[pyo3(name = "_causal_token_summary")]
+    fn py_causal_token_summary(
+        &self,
+        py: Python,
+        text: &str,
+        allowed_special: HashSet<PyBackedStr>,
+        eos: Rank,
+    ) -> PyResult<(usize, usize, bool)> {
+        py.detach(|| {
+            let allowed_special: HashSet<&str> =
+                allowed_special.iter().map(|s| s.as_ref()).collect();
+            let (tokens, _) = self
+                .encode(text, &allowed_special)
+                .map_err(|e| PyErr::new::<exceptions::PyValueError, _>(e.message))?;
+            Ok((
+                tokens.len(),
+                tokens.iter().filter(|token| **token == eos).count(),
+                tokens.last() == Some(&eos),
+            ))
+        })
+    }
+
     #[pyo3(name = "_encode_with_character_offsets")]
     fn py_encode_with_character_offsets(
         &self,
