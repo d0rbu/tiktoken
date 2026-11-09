@@ -474,6 +474,56 @@ impl CoreBPE {
         offsets
     }
 
+    /// Reuse only identical prefix coordinates inside one exact-decoder operation.
+    #[cfg(any(feature = "python", test))]
+    fn indexed_prefix_offsets(
+        &self,
+        text: &str,
+        rows: Vec<Vec<Rank>>,
+        boundaries: &[usize],
+    ) -> Vec<(Vec<Rank>, Vec<(usize, usize)>)> {
+        let mut characters = Vec::with_capacity(text.len() + 1);
+        for (index, pair) in boundaries.windows(2).enumerate() {
+            characters.resize(pair[1], index);
+        }
+        characters.push(boundaries.len() - 1);
+        let mut byte_ends = vec![0usize];
+        let mut result: Vec<(Vec<Rank>, Vec<(usize, usize)>)> = Vec::with_capacity(rows.len());
+        for ids in rows {
+            let prior = result.last();
+            let common = prior.map_or(0, |(previous_ids, _)| {
+                ids.iter()
+                    .zip(previous_ids)
+                    .take_while(|(a, b)| a == b)
+                    .count()
+            });
+            let mut offsets = Vec::with_capacity(ids.len());
+            if let Some((_, previous_offsets)) = prior {
+                offsets.extend_from_slice(&previous_offsets[..common]);
+            }
+            // Exact decoders give identical byte ends and character spans for
+            // identical token prefixes, even when the next requested EOF shrinks.
+            byte_ends.truncate(common + 1);
+            let mut byte_start = byte_ends[common];
+            for token in &ids[common..] {
+                let bytes = self
+                    .special_tokens_decoder
+                    .get(token)
+                    .or_else(|| self.decoder.get(token))
+                    .expect("encoded token has a decoder entry");
+                let byte_end = byte_start + bytes.len();
+                offsets.push((
+                    characters[byte_start],
+                    characters[byte_end] + usize::from(!text.is_char_boundary(byte_end)),
+                ));
+                byte_ends.push(byte_end);
+                byte_start = byte_end;
+            }
+            result.push((ids, offsets));
+        }
+        result
+    }
+
     /// Character-coordinate prefix ends; return through the first ineligible prefix.
     #[cfg(any(feature = "python", test))]
     fn encode_with_character_offsets_prefixes(
@@ -496,6 +546,9 @@ impl CoreBPE {
             if let Some(rows) =
                 self.try_encode_prefixes_indexed(text, &byte_ends, allowed, max_tokens)
             {
+                if self.exact_target_decoder && rows.len() > 1 {
+                    return Ok(self.indexed_prefix_offsets(text, rows, &boundaries));
+                }
                 return Ok(rows
                     .into_iter()
                     .zip(byte_ends)
