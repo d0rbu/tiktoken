@@ -33,6 +33,12 @@ byte length, so embedded or trailing zero bytes remain distinct. Longer keys kee
 their original byte-vector representation. This changes lookup storage only;
 token ranks, merge ordering, special tokens and decoding retain their meanings.
 
+The exact guarded RMCP pretokenizer uses one compile-time 256-byte table for
+its ASCII byte classes. Scalar short-run tails and punctuation/whitespace runs
+share the table; the SSE2 long-run loop and Unicode DFA are unchanged. This
+preserves contraction priority, optional leading spaces and whitespace withholding.
+Other patterns keep the original fancy-regex path.
+
 RMCP prefix character-offset results remain ordinary, independently mutable Python
 lists. During one call, exact matching adjacent prefix entries can share only
 immutable Python integers and span tuples; the lists themselves remain separate.
