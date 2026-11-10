@@ -178,3 +178,17 @@ re-encodes each prefix's last two pieces at EOF. The same complete-byte vocabula
 full special-token policy, 64 KiB and amortized-work guards as range counting apply.
 Unsupported calls retain ordered scalar encoding, including native error behavior.
 No index or result is retained across calls; duplicate and unsorted ends are allowed.
+
+## RMCP compact short-merge offsets
+
+The existing short-piece BPE kernel uses `u8` offsets for its document-local
+scratch entries. Its caller only selects pieces of 2 through 99 bytes, including
+the terminator offset, so each `(offset, rank)` occupies 8 rather than 16 bytes.
+The same merge kernel retains `usize` offsets for the general public split path;
+merge priorities, first-minimum tie order, vocabulary and errors are unchanged.
+
+A frozen prior-kernel oracle checks all short lengths, reused scratch, tied ranks
+and wider general offsets. The retained complete RMCP workload measured median
+candidate/baseline CPU ratios 0.935651 for preparation and 0.963060 for the ordinary
+renderer, with all original output bytes equal. These serial local observations
+use four fixed AB/BA pairs, not isolated capacity or training-throughput claims.
