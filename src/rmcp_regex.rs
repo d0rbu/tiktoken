@@ -113,14 +113,26 @@ pub(crate) fn compile_if_guarded(pattern: &str) -> Result<Option<RegularRegex>, 
     Ok(Some(regex))
 }
 
-fn ascii_class(byte: u8) -> u8 {
-    match byte {
-        b'A'..=b'Z' | b'a'..=b'z' => 1,
-        b'0'..=b'9' => 2,
-        9..=13 | b' ' => 0,
-        0..=127 => 3,
-        _ => 4,
+// Preserve the guarded pattern's five byte classes without repeated range
+// decisions in scalar runs. Non-ASCII bytes always select the Unicode fallback.
+const ASCII_CLASSES: [u8; 256] = {
+    let mut classes = [4; 256];
+    let mut byte = 0;
+    while byte < 128 {
+        classes[byte] = match byte as u8 {
+            b'A'..=b'Z' | b'a'..=b'z' => 1,
+            b'0'..=b'9' => 2,
+            9..=13 | b' ' => 0,
+            _ => 3,
+        };
+        byte += 1;
     }
+    classes
+};
+
+#[inline]
+fn ascii_class(byte: u8) -> u8 {
+    ASCII_CLASSES[usize::from(byte)]
 }
 
 #[inline]
@@ -156,13 +168,7 @@ fn ascii_alphanumeric_run<const LETTERS: bool>(bytes: &[u8]) -> usize {
             end += 16;
         }
     }
-    while end < bytes.len()
-        && if LETTERS {
-            bytes[end].is_ascii_alphabetic()
-        } else {
-            bytes[end].is_ascii_digit()
-        }
-    {
+    while end < bytes.len() && ascii_class(bytes[end]) == if LETTERS { 1 } else { 2 } {
         end += 1;
     }
     end
@@ -344,6 +350,47 @@ mod tests {
     use crate::{CoreBPE, HashMap, Rank};
 
     const GUARDED_WHITESPACE: &str = r"\x{9}-\x{d}\x{20}\x{85}\x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}-\x{2029}\x{202f}\x{205f}\x{3000}";
+
+    #[test]
+    fn class_table_matches_every_byte() {
+        for byte in 0..=255_u8 {
+            let expected = match byte {
+                b'A'..=b'Z' | b'a'..=b'z' => 1,
+                b'0'..=b'9' => 2,
+                9..=13 | b' ' => 0,
+                0..=127 => 3,
+                _ => 4,
+            };
+            assert_eq!(super::ascii_class(byte), expected, "byte {byte}");
+        }
+    }
+
+    #[test]
+    fn scalar_and_vector_tails_stop_at_every_byte_boundary() {
+        for length in [0, 1, 7, 14, 15, 16, 17, 30, 31, 32, 33, 63, 64, 65] {
+            for byte in 0..=255_u8 {
+                for head in [b'a', b'Z', b'0', b'9'] {
+                    let mut input = vec![head; length];
+                    input.push(byte);
+                    input.extend_from_slice(b"ab09");
+                    assert_eq!(
+                        super::ascii_alphanumeric_run::<true>(&input),
+                        input
+                            .iter()
+                            .take_while(|value| value.is_ascii_alphabetic())
+                            .count()
+                    );
+                    assert_eq!(
+                        super::ascii_alphanumeric_run::<false>(&input),
+                        input
+                            .iter()
+                            .take_while(|value| value.is_ascii_digit())
+                            .count()
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn vector_runs_preserve_boundaries_and_unicode_fallback() {
