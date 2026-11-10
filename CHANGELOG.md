@@ -1,3 +1,9 @@
+## RMCP private offset prefix reuse
+
+- Reuse exact adjacent-prefix character spans with operation-local byte ends;
+  preserve independent mutable outputs, scalar aliases and fallback/error order.
+- Real-workload comparison and adverse controls are recorded in RMCP_BUILD.md.
+
 # Changelog
 
 This is the changelog for the open source version of tiktoken.

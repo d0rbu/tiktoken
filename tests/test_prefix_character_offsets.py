@@ -152,3 +152,50 @@ def test_partial_vocabulary_preserves_first_error_and_limit_order():
     with pytest.raises(type(scalar.value)) as actual:
         core._encode_with_character_offsets_prefixes("a!", [1, 2, 999], allowed, 100)
     assert str(actual.value) == str(scalar.value)
+
+
+@pytest.mark.parametrize("duplicate", [False, True])
+@pytest.mark.parametrize("limit", [0, 1, 100000])
+def test_aliased_decoders_keep_scalar_offset_semantics(duplicate, limit):
+    ranks = {bytes([value]): value for value in range(256)}
+    specials = {"<S>": 300, "other": 300} if duplicate else {"<S>": ord("a")}
+    pattern = (Path(__file__).parents[1] / "src/rmcp_pattern.txt").read_text()
+    core = _tiktoken.CoreBPE(ranks, specials, pattern)
+    allowed = frozenset(specials)
+    text = "aé😀<S>other aaaa " * 3
+    ends = list(range(1, len(text) + 1)) + [len(text), 1, len(text)]
+    wanted = []
+    for end in ends:
+        row = core._encode_with_character_offsets(text[:end], allowed)
+        wanted.append(row)
+        if not row[0] or len(row[0]) > limit:
+            break
+    assert core._encode_with_character_offsets_prefixes(text, ends, allowed, limit) == wanted
+
+
+@settings(max_examples=150, deadline=None)
+@given(
+    text=st.text(st.sampled_from(["a", "é", "😀", "中", "\0", " ", "\n"]), min_size=4, max_size=160),
+    limit=st.integers(min_value=0, max_value=200),
+)
+def test_shared_byte_coordinates_match_every_independent_prefix(text, limit):
+    core, decoder, allowed = model()
+    ends = list(range(1, len(text) + 1))
+    assert core._encode_with_character_offsets_prefixes(text, ends, allowed, limit) == reference(
+        core, decoder, text, ends, allowed, limit
+    )
+
+
+@pytest.mark.parametrize("guarded", [True, False])
+def test_shared_prefix_coordinates_survive_reordered_utf8_and_special_eofs(guarded):
+    core, decoder, allowed = model(guarded)
+    text = "aé😀<S>long abc éS aaaa\n" * 12
+    ends = [len(text), 2, len(text), 7, len(text) - 1, 3, len(text), 1]
+    ends += list(range(1, len(text) + 1))
+    expected_rows = reference(core, decoder, text, ends, allowed, 100000)
+    actual = core._encode_with_character_offsets_prefixes(text, ends, allowed, 100000)
+    assert actual == expected_rows
+    actual[0][1].clear()
+    actual[0][0].append(-1)
+    assert actual[1:] == expected_rows[1:]
+    assert core._encode_with_character_offsets_prefixes(text, ends, allowed, 100000) == expected_rows

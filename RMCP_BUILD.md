@@ -1,3 +1,33 @@
+## Shared prefix offset projection (`0.14.0+rmcp.132.offsetprefixreuse1`)
+
+The private character-offset prefix encoder reuses only identical token prefixes
+inside one admitted exact-decoder call. Each output still owns its token and
+span vectors; Python lists remain independently mutable. One operation-local
+byte-to-character index and the previous row's byte ends let changed suffixes
+retain scalar floor/ceiling spans, including tokens splitting Unicode scalars.
+Unsorted/repeated EOFs and shrinking prefixes retain their original results.
+Aliased special IDs and every existing unsupported or early-error path keep the
+scalar implementation. The original 65,536-byte indexed limit is unchanged.
+There is no persistent cache, constructor scan or changed encoding.
+
+A diagnostic over all 11,028 real originals / 180,957 causal views counted
+57,989,205 identical adjacent-prefix tokens among 62,921,413 indexed tokens
+(92.16%). Counts are not time savings. Separate uninstrumented four-pair
+AB/BA/AB/BA comparisons used freshly built original and candidate release wheels,
+Rust 1.90.0 and identical x86-64 flags. Complete causal CPU/elapsed medians were
+0.940023271 / 0.939748461, with every pair improving. The complete clean-producer
+control medians were 0.983249165 / 0.984199636; its maximum CPU ratio was
+1.042720985 and an adverse elapsed ratio was 1.198936193. Shared-host variation
+is retained rather than pooled or retaken. These are local CPU preparation
+measurements, not training or provider throughput.
+
+All 22 fresh children passed; full causal fields and all 30 clean files
+(393,135,299 bytes per sample) match. Ten exclusive outputs were removed after
+parity. The candidate passed 72 release-mode Rust tests, 122 native Python
+contracts and 204 RMCP causal contracts. Three previous distinct candidates
+remain rejected at their original performance limits. Final dependency-pinned
+RMCP correctness and its complete local gate remain required for adoption.
+
 ## Original character-offset projection (`0.14.0+rmcp.121.charoffset1`)
 
 The private `CoreBPE._encode_with_character_offsets(text, allowed_special)`
