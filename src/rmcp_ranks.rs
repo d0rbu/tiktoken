@@ -99,6 +99,7 @@ impl MediumKey {
 
 #[derive(Clone)]
 pub(crate) struct EncoderRanks {
+    single: [Option<Rank>; 256],
     short: HashMap<u64, Rank>,
     medium: HashMap<MediumKey, Rank>,
     long: HashMap<Vec<u8>, Rank>,
@@ -108,16 +109,24 @@ impl From<HashMap<Vec<u8>, Rank>> for EncoderRanks {
     fn from(ranks: HashMap<Vec<u8>, Rank>) -> Self {
         let mut counts = [0; 3];
         for bytes in ranks.keys() {
+            if bytes.len() == 1 {
+                continue;
+            }
             counts[match bytes.len() {
                 0..=7 => 0,
                 8..=15 => 1,
                 _ => 2,
             }] += 1;
         }
+        let mut single = [None; 256];
         let mut short = HashMap::with_capacity_and_hasher(counts[0], Default::default());
         let mut medium = HashMap::with_capacity_and_hasher(counts[1], Default::default());
         let mut long = HashMap::with_capacity_and_hasher(counts[2], Default::default());
         for (bytes, rank) in ranks {
+            if bytes.len() == 1 {
+                single[usize::from(bytes[0])] = Some(rank);
+                continue;
+            }
             match bytes.len() {
                 0..=7 => short.insert(short_key(&bytes), rank),
                 8..=15 => medium.insert(MediumKey::from_bytes(&bytes), rank),
@@ -125,6 +134,7 @@ impl From<HashMap<Vec<u8>, Rank>> for EncoderRanks {
             };
         }
         Self {
+            single,
             short,
             medium,
             long,
@@ -136,7 +146,8 @@ impl EncoderRanks {
     #[inline(always)]
     pub(crate) fn get(&self, bytes: &[u8]) -> Option<&Rank> {
         match bytes.len() {
-            0..=7 => self.short.get(&short_key(bytes)),
+            1 => self.single[usize::from(bytes[0])].as_ref(),
+            0 | 2..=7 => self.short.get(&short_key(bytes)),
             8..=15 => self.medium.get(&MediumKey::from_bytes(bytes)),
             _ => self.long.get(bytes),
         }
@@ -149,7 +160,8 @@ impl EncoderRanks {
             return self.get(bytes);
         }
         match bytes.len() {
-            0..=7 => self
+            1 => self.single[usize::from(bytes[0])].as_ref(),
+            0 | 2..=7 => self
                 .short
                 .get(&short_key_window(source, start, bytes.len())),
             8..=15 => self.medium.get(&MediumKey {
@@ -189,6 +201,43 @@ impl Index<&[u8]> for EncoderRanks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn single_bytes_match_original_map_for_complete_and_partial_vocabularies() {
+        for stride in [1, 2, 17] {
+            let mut original = HashMap::default();
+            original.insert(Vec::new(), 71);
+            original.insert(vec![0, 0], 83);
+            for byte in (0..=255_u8).step_by(stride) {
+                let rank = match byte {
+                    0 => 0,
+                    255 => Rank::MAX,
+                    _ => 1000 + Rank::from(byte),
+                };
+                original.insert(vec![byte], rank);
+            }
+            let ranks = EncoderRanks::from(original.clone());
+            let cloned = ranks.clone();
+            drop(ranks);
+            for byte in 0..=255_u8 {
+                let key = [byte];
+                assert_eq!(cloned.get(&key), original.get(key.as_slice()));
+                assert_eq!(cloned.get_span(&key, 0, 1), original.get(key.as_slice()));
+                for start in 0..24 {
+                    let mut parent = [255; 24];
+                    parent[start] = byte;
+                    assert_eq!(
+                        cloned.get_span(&parent, start, start + 1),
+                        original.get(key.as_slice())
+                    );
+                }
+            }
+            assert_eq!(cloned.get(&[]), original.get(&[][..]));
+            assert_eq!(cloned.get(&[0, 0]), original.get(&[0, 0][..]));
+            assert_eq!(cloned.get_span(&[0; 24], 11, 11), original.get(&[][..]));
+            assert_eq!(cloned.get_span(&[0; 24], 11, 13), original.get(&[0, 0][..]));
+        }
+    }
 
     #[test]
     fn parent_window_matches_all_short_lengths_and_end_alignments() {
@@ -319,7 +368,10 @@ mod tests {
         }
         let ranks = EncoderRanks::from(original.clone());
         assert_eq!(
-            ranks.short.len() + ranks.medium.len() + ranks.long.len(),
+            ranks.single.iter().flatten().count()
+                + ranks.short.len()
+                + ranks.medium.len()
+                + ranks.long.len(),
             original.len()
         );
         for (bytes, rank) in &original {
