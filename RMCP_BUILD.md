@@ -1,3 +1,31 @@
+## Original character-offset projection (`0.14.0+rmcp.121.charoffset1`)
+
+The private `CoreBPE._encode_with_character_offsets(text, allowed_special)`
+returns ordinary Python ID and `(start, end)` character-offset lists for the
+RMCP owner's admitted complete byte vocabulary and full-input piece pattern.
+The existing scalar encoder still produces every token. A monotone UTF-8 scalar
+cursor projects each token's first and last bytes: a token splitting a scalar
+starts at that scalar and ends after it. Specials retain the caller's admitted
+ID/width mapping. Empty input returns two empty lists.
+
+This replaces the consumer's per-row NumPy byte, boundary and list intermediates.
+It does not change encoding, matching, allowed-special selection, count-only
+calls, model admission or postprocessing. Inputs and allowed specials use the
+scalar binding's extraction and encoding-error mapping; allocation failure timing
+is not promised identical. No offset cache, worker, alternate causal view or
+mutable shared state is added. Unsupported models and surrogate text remain the
+RMCP caller's original fallback responsibility.
+
+The separate four-pair real RewardBench2 screen processed all 11,028 originals /
+180,957 causal rows. Complete 184-file outputs (393,152,783 bytes per arm) and
+warnings matched. Median paired CPU/elapsed ratios were 0.88703/0.78254; every
+pair improved. A separate full-public-causal-view control had exact complete
+view hashes and CPU/elapsed medians 0.78389/0.78428. Both private builds used
+Rust/Cargo 1.90.0, Python 3.12.11 and the same release flags. These are selected
+shared-host screen results, not installed RMCP, universal elapsed, GPU or
+training throughput qualification. RMCP requires its own installed comparison
+and full integrated gate before adoption.
+
 ## Grouped direct storage decode candidate
 
 The direct 17-bit decoder now uses the generic storage decoder's existing
@@ -270,3 +298,30 @@ background tasks or persistent caches are added.
 ## Private model admission
 
 The RMCP-only model helpers retain the existing ordered vocabulary, merge, byte-alphabet, and proof-quota rules while running their loops in the extension. Public encoding and generic callback behavior stay the same. `tests/test_rmcp_model.py` exercises rejection, callback ordering, quotas, and byte conversion.
+
+## Consumed causal target bounds (`0.14.0+rmcp.123.targetprefixes1`)
+
+The private `_encode_with_character_targets_prefixes` method consumes ordered
+character target spans through the unchanged prefix encoder. It projects each
+fresh Rust offset vector to its first and last overlapping token indices before
+constructing Python results. Each result retains an independent mutable ID list;
+only immutable Python integers are shared across common prefixes. Full offset
+encoding and every public API remain unchanged. The consumer retains its original
+ordered prefix-length and nonempty-target checks.
+
+The complete native suites passed 70 release-mode Rust tests and 2,662 Python
+tests against the normally installed wheel. New scalar-offset oracles exercise
+Unicode, allowed-special policies, unsorted and repeated spans, size boundaries,
+first-error order, concurrency and independent mutable lists. The Python suite
+runs outside the source checkout, as installed-wheel tests require; the retained
+first invocation's two nested imports instead selected the unbuilt checkout.
+
+Combined with its RMCP caller, the fixed four-pair complete clean-token workload
+used 6.73% less CPU and 4.48% less wall time at median paired ratios. All four
+CPU and wall pairs improved, and all 184 output files and 180,957 ordered rows
+matched exactly. Both native arms were freshly built with Rust 1.90.0 and the
+same release flags. This shared-host comparison includes the caller and durable
+publication; it does not establish isolated native, storage or training speed.
+The excluded warmups were substantially slower. Original inputs and adverse
+evidence remain; all ten generated output trees were removed after parity.
+The RMCP lock update and complete repository gate remain required before adoption.

@@ -13,17 +13,17 @@ mod py;
 mod rmcp_model;
 #[cfg(any(feature = "python", test))]
 mod rmcp_ranges;
-mod rmcp_regex;
 mod rmcp_ranks;
+mod rmcp_regex;
 use rmcp_ranks::{EncoderRanks, RankLookup};
 #[cfg(any(feature = "python", test))]
 mod rmcp_source;
-#[cfg(any(feature = "python", test))]
-mod rmcp_token_tier;
 #[cfg(feature = "python")]
 mod rmcp_token_bits;
 #[cfg(any(feature = "python", test))]
 mod rmcp_token_storage;
+#[cfg(any(feature = "python", test))]
+mod rmcp_token_tier;
 
 pub type Rank = u32;
 
@@ -197,7 +197,7 @@ fn _byte_pair_merge_into(
                 // Similar to `piece[i..i + 2]` above. The +3 is because we haven't yet deleted
                 // parts[i + 1], see comment in the main loop.
                 *ranks
-                    .get(&piece[parts[i].0..parts[i + 3].0])
+                    .get_span(piece, parts[i].0, parts[i + 3].0)
                     .unwrap_or(&Rank::MAX)
             } else {
                 Rank::MAX
@@ -437,6 +437,89 @@ impl CoreBPE {
             .map(|(tokens, last_piece, _)| (tokens, last_piece))
     }
 
+    /// Project encoded byte spans to original character spans for complete byte vocabularies.
+    #[cfg(any(feature = "python", test))]
+    fn encode_with_character_offsets(
+        &self,
+        text: &str,
+        allowed_special: &HashSet<&str>,
+    ) -> Result<(Vec<Rank>, Vec<(usize, usize)>), EncodeError> {
+        let (tokens, _) = self.encode(text, allowed_special)?;
+        let offsets = self.character_offsets(text, &tokens);
+        Ok((tokens, offsets))
+    }
+
+    #[cfg(any(feature = "python", test))]
+    fn character_offsets(&self, text: &str, tokens: &[Rank]) -> Vec<(usize, usize)> {
+        let mut character_starts = text.char_indices().map(|(byte, _)| byte).peekable();
+        let mut character_end = 0;
+        let mut byte_start = 0;
+        let mut offsets = Vec::with_capacity(tokens.len());
+        for token in tokens {
+            let start = character_end - usize::from(!text.is_char_boundary(byte_start));
+            let bytes = self
+                .special_tokens_decoder
+                .get(token)
+                .or_else(|| self.decoder.get(token))
+                .expect("encoded token has a decoder entry");
+            let byte_end = byte_start + bytes.len();
+            while character_starts.peek().is_some_and(|&byte| byte < byte_end) {
+                character_starts.next();
+                character_end += 1;
+            }
+            offsets.push((start, character_end));
+            byte_start = byte_end;
+        }
+        offsets
+    }
+
+    /// Character-coordinate prefix ends; return through the first ineligible prefix.
+    #[cfg(any(feature = "python", test))]
+    fn encode_with_character_offsets_prefixes(
+        &self,
+        text: &str,
+        ends: &[usize],
+        allowed: &HashSet<&str>,
+        max_tokens: usize,
+    ) -> Result<Vec<(Vec<Rank>, Vec<(usize, usize)>)>, EncodeError> {
+        let boundaries: Vec<usize> = text
+            .char_indices()
+            .map(|(byte, _)| byte)
+            .chain([text.len()])
+            .collect();
+        let byte_ends: Option<Vec<usize>> = ends
+            .iter()
+            .map(|&end| boundaries.get(end).copied())
+            .collect();
+        if let Some(byte_ends) = byte_ends {
+            if let Some(rows) =
+                self.try_encode_prefixes_indexed(text, &byte_ends, allowed, max_tokens)
+            {
+                return Ok(rows
+                    .into_iter()
+                    .zip(byte_ends)
+                    .map(|(ids, end)| {
+                        let offsets = self.character_offsets(&text[..end], &ids);
+                        (ids, offsets)
+                    })
+                    .collect());
+            }
+        }
+        let mut rows = Vec::with_capacity(ends.len());
+        for &end in ends {
+            let byte = boundaries.get(end).ok_or_else(|| EncodeError {
+                message: "prefix end exceeds the original character bounds".to_owned(),
+            })?;
+            let row = self.encode_with_character_offsets(&text[..*byte], allowed)?;
+            let stop = row.0.is_empty() || row.0.len() > max_tokens;
+            rows.push(row);
+            if stop {
+                break;
+            }
+        }
+        Ok(rows)
+    }
+
     /// Count tokens for complete byte vocabularies without materializing output IDs.
     pub fn count_tokens(
         &self,
@@ -491,7 +574,11 @@ impl CoreBPE {
                 };
 
                 let piece = piece.as_bytes();
-                if let Some(token) = self.encoder.get(piece) {
+                let piece_start = piece.as_ptr() as usize - text.as_ptr() as usize;
+                if let Some(token) =
+                    self.encoder
+                        .get_span(text.as_bytes(), piece_start, piece_start + piece.len())
+                {
                     last_piece_token_len = 1;
                     if COUNT_ONLY {
                         count += 1;
@@ -514,11 +601,12 @@ impl CoreBPE {
                     if COUNT_ONLY {
                         count += last_piece_token_len;
                     } else {
-                        ret.extend(
-                            parts
-                                .windows(2)
-                                .map(|part| self.encoder[&piece[part[0].0..part[1].0]]),
-                        );
+                        ret.extend(parts.windows(2).map(|part| {
+                            *self
+                                .encoder
+                                .get_span(piece, part[0].0, part[1].0)
+                                .expect("no entry found for key")
+                        }));
                     }
                 } else {
                     let tokens = _byte_pair_encode(piece, &self.encoder);
@@ -1048,7 +1136,9 @@ mod owned_batch_tests {
 
     #[test]
     fn serial_batch_preserves_document_boundaries_and_specials() {
-        let texts = ["", "a", "b", "ab", "abc", "a b", " 's\r\n", "é😀\0", "<S>aa<T>"];
+        let texts = [
+            "", "a", "b", "ab", "abc", "a b", " 's\r\n", "é😀\0", "<S>aa<T>",
+        ];
         for pattern in [include_str!("rmcp_pattern.txt"), r"[\s\S]+"] {
             let model = core(pattern);
             for allowed in [HashSet::new(), HashSet::from(["<S>", "<T>"])] {
@@ -1056,7 +1146,9 @@ mod owned_batch_tests {
                     .iter()
                     .map(|text| model.encode(text, &allowed).unwrap().0)
                     .collect();
-                let actual = model.encode_batch_serial(texts.into_iter(), &allowed).unwrap();
+                let actual = model
+                    .encode_batch_serial(texts.into_iter(), &allowed)
+                    .unwrap();
                 assert_eq!(actual, expected);
                 for (text, row) in texts.iter().zip(&actual) {
                     assert_eq!(model.decode_bytes(row).unwrap(), text.as_bytes());
@@ -1072,7 +1164,12 @@ mod owned_batch_tests {
     fn serial_batch_keeps_empty_rows_and_independent_owned_vectors() {
         let model = core(r"[\s\S]+");
         let allowed = HashSet::new();
-        assert!(model.encode_batch_serial(std::iter::empty(), &allowed).unwrap().is_empty());
+        assert!(
+            model
+                .encode_batch_serial(std::iter::empty(), &allowed)
+                .unwrap()
+                .is_empty()
+        );
         let mut rows = model
             .encode_batch_serial(["", "ab", "ab", ""].into_iter(), &allowed)
             .unwrap();
@@ -1102,13 +1199,20 @@ mod owned_batch_tests {
             model.count_tokens(bad, &allowed).unwrap_err().message,
             expected.message
         );
-        let texts = ["c", bad].into_iter().chain(std::iter::once_with(|| -> &str {
-            panic!("a later document must not be requested after the first encode error")
-        }));
+        let texts = ["c", bad]
+            .into_iter()
+            .chain(std::iter::once_with(|| -> &str {
+                panic!("a later document must not be requested after the first encode error")
+            }));
         let actual = model.encode_batch_serial(texts, &allowed).unwrap_err();
         assert_eq!(actual.message, expected.message);
         assert!(actual.message.starts_with("Regex error while tokenizing:"));
-        assert_eq!(model.encode_batch_serial(["c"].into_iter(), &allowed).unwrap(), [vec![99]]);
+        assert_eq!(
+            model
+                .encode_batch_serial(["c"].into_iter(), &allowed)
+                .unwrap(),
+            [vec![99]]
+        );
     }
 }
 
@@ -1118,6 +1222,29 @@ mod tests {
     use rustc_hash::FxHashMap as HashMap;
 
     use crate::{Rank, byte_pair_split};
+
+    #[test]
+    fn character_offsets_cover_split_scalars_specials_and_empty_input() {
+        let ranks = (0u32..256).map(|byte| (vec![byte as u8], byte)).collect();
+        let model = crate::CoreBPE::new_internal(
+            ranks,
+            HashMap::from_iter([("<S>".to_owned(), 300)]),
+            r"[\s\S]+",
+        )
+        .unwrap();
+        let allowed = std::collections::HashSet::from(["<S>"]);
+        assert_eq!(
+            model.encode_with_character_offsets("", &allowed).unwrap(),
+            (vec![], vec![])
+        );
+        let text = "é<S>😀";
+        let (ids, offsets) = model.encode_with_character_offsets(text, &allowed).unwrap();
+        assert_eq!(ids, model.encode(text, &allowed).unwrap().0);
+        assert_eq!(
+            offsets,
+            vec![(0, 1), (0, 1), (1, 4), (4, 5), (4, 5), (4, 5), (4, 5)]
+        );
+    }
 
     fn setup_ranks() -> HashMap<Vec<u8>, Rank> {
         HashMap::from_iter([(b"ab".to_vec(), 0), (b"cd".to_vec(), 1)])

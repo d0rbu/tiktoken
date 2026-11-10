@@ -11,7 +11,28 @@ use rustc_hash::FxHashMap as HashMap;
 use crate::rmcp_source::{Batch as SourceBatch, Cursor as SourceCursor, ReadError};
 use crate::rmcp_token_storage;
 use crate::rmcp_token_tier;
-use crate::{CoreBPE, Rank, _byte_pair_encode};
+use crate::{_byte_pair_encode, CoreBPE, Rank};
+
+fn packed_ranks(mut raw: &[u8]) -> PyResult<HashMap<Vec<u8>, Rank>> {
+    let mut ranks = HashMap::default();
+    while !raw.is_empty() {
+        let header = raw
+            .get(..8)
+            .ok_or_else(|| exceptions::PyValueError::new_err("truncated packed rank header"))?;
+        let rank = u32::from_le_bytes(header[..4].try_into().unwrap());
+        let size = u32::from_le_bytes(header[4..].try_into().unwrap()) as usize;
+        raw = &raw[8..];
+        let word = raw
+            .get(..size)
+            .ok_or_else(|| exceptions::PyValueError::new_err("truncated packed rank word"))?;
+        ranks.insert(word.to_vec(), rank);
+        raw = &raw[size..];
+    }
+    if ranks.is_empty() {
+        return Err(exceptions::PyValueError::new_err("empty packed ranks"));
+    }
+    Ok(ranks)
+}
 
 fn storage_width(width: u8) -> PyResult<u8> {
     match width {
@@ -247,6 +268,49 @@ struct OwnedSourceBatch {
     batch: SourceBatch,
 }
 
+#[pyclass]
+struct OwnedEncodedSourceBatch {
+    provenance: Vec<Option<String>>,
+    encoded: Option<Result<(Vec<Rank>, Vec<usize>), crate::EncodeError>>,
+}
+
+#[pymethods]
+impl OwnedEncodedSourceBatch {
+    #[getter]
+    fn provenance(&self) -> Vec<Option<String>> {
+        self.provenance.clone()
+    }
+
+    fn encoded(&mut self, py: Python<'_>) -> PyResult<(Py<PyAny>, Vec<usize>)> {
+        // This is a single-use handoff to the Python encoding boundary. Keep
+        // encoding failures here rather than turning them into source errors.
+        let (ids, lengths) = self
+            .encoded
+            .take()
+            .ok_or_else(|| exceptions::PyRuntimeError::new_err("source batch already consumed"))?
+            .map_err(|error| exceptions::PyValueError::new_err(error.message))?;
+        Ok((TiktokenBuffer::new(ids).into_py_any(py)?, lengths))
+    }
+}
+
+impl CoreBPE {
+    fn encode_source_rows(
+        &self,
+        batch: &SourceBatch,
+        allowed: &HashSet<&str>,
+        eos: Rank,
+    ) -> Result<(Vec<Rank>, Vec<usize>), crate::EncodeError> {
+        let rows = self.encode_batch_serial(batch.texts.iter().map(String::as_str), allowed)?;
+        let lengths: Vec<usize> = rows.iter().map(|row| row.len() + 1).collect();
+        let mut ids = Vec::with_capacity(lengths.iter().sum());
+        for row in rows {
+            ids.extend(row);
+            ids.push(eos);
+        }
+        Ok((ids, lengths))
+    }
+}
+
 #[pymethods]
 impl OwnedSourceCursor {
     fn close(&mut self) {
@@ -289,6 +353,35 @@ impl OwnedSourceBatch {
 
 #[pymethods]
 impl CoreBPE {
+    fn _read_encode_source_batch(
+        &self,
+        py: Python<'_>,
+        mut cursor: PyRefMut<'_, OwnedSourceCursor>,
+        allowed_special: HashSet<PyBackedStr>,
+        eos: Rank,
+        provenance: bool,
+    ) -> PyResult<Option<OwnedEncodedSourceBatch>> {
+        let inner = &mut cursor.cursor;
+        let result = py.detach(|| {
+            let Some(batch) = inner.batch(provenance)? else {
+                return Ok(None);
+            };
+            let allowed = allowed_special.iter().map(|s| s.as_ref()).collect();
+            let encoded = self.encode_source_rows(&batch, &allowed, eos);
+            Ok(Some(OwnedEncodedSourceBatch {
+                provenance: batch.provenance,
+                encoded: Some(encoded),
+            }))
+        });
+        match result {
+            Ok(batch) => Ok(batch),
+            Err(ReadError::Io(error)) => Err(source_io_error(py, error, &cursor.path)),
+            Err(ReadError::Declined) => Err(exceptions::PyNotImplementedError::new_err(
+                "source batch requires the original Python decoder before encoding",
+            )),
+        }
+    }
+
     #[pyo3(signature = (path, split, start, stop=None))]
     fn _open_source(
         &self,
@@ -315,15 +408,7 @@ impl CoreBPE {
     ) -> PyResult<(Py<PyAny>, Vec<usize>)> {
         let result = py.detach(|| {
             let allowed: HashSet<&str> = allowed_special.iter().map(|s| s.as_ref()).collect();
-            let rows =
-                self.encode_batch_serial(batch.batch.texts.iter().map(String::as_str), &allowed)?;
-            let lengths: Vec<usize> = rows.iter().map(|row| row.len() + 1).collect();
-            let mut ids = Vec::with_capacity(lengths.iter().sum());
-            for row in rows {
-                ids.extend(row);
-                ids.push(eos);
-            }
-            Ok::<_, crate::EncodeError>((ids, lengths))
+            self.encode_source_rows(&batch.batch, &allowed, eos)
         });
         let (ids, lengths) =
             result.map_err(|error| exceptions::PyValueError::new_err(error.message))?;
@@ -338,6 +423,32 @@ impl CoreBPE {
     ) -> PyResult<Self> {
         Self::new_internal(encoder, special_tokens_encoder, pattern)
             .map_err(|e| PyErr::new::<exceptions::PyValueError, _>(e.to_string()))
+    }
+
+    #[staticmethod]
+    fn _from_packed_ranks(
+        ranks: &Bound<'_, PyBytes>,
+        special_tokens: HashMap<String, Rank>,
+        pattern: &str,
+    ) -> PyResult<(Self, Rank)> {
+        let encoder = packed_ranks(ranks.as_bytes())?;
+        let maximum = encoder
+            .values()
+            .chain(special_tokens.values())
+            .copied()
+            .max()
+            .unwrap();
+        let core = Self::new_internal(encoder, special_tokens, pattern)
+            .map_err(|e| PyErr::new::<exceptions::PyValueError, _>(e.to_string()))?;
+        Ok((core, maximum))
+    }
+
+    fn _mergeable_ranks(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let ranks = pyo3::types::PyDict::new(py);
+        for (rank, word) in &self.decoder {
+            ranks.set_item(PyBytes::new(py, word), rank)?;
+        }
+        Ok(ranks.into_any().unbind())
     }
 
     // ====================
@@ -364,6 +475,121 @@ impl CoreBPE {
                 Err(e) => Err(PyErr::new::<exceptions::PyValueError, _>(e.message)),
             }
         })
+    }
+
+    #[pyo3(name = "_encode_with_character_offsets")]
+    fn py_encode_with_character_offsets(
+        &self,
+        py: Python,
+        text: &str,
+        allowed_special: HashSet<PyBackedStr>,
+    ) -> PyResult<(Vec<Rank>, Vec<(usize, usize)>)> {
+        py.detach(|| {
+            let allowed_special: HashSet<&str> =
+                allowed_special.iter().map(|s| s.as_ref()).collect();
+            self.encode_with_character_offsets(text, &allowed_special)
+                .map_err(|e| PyErr::new::<exceptions::PyValueError, _>(e.message))
+        })
+    }
+
+    #[pyo3(name = "_encode_with_character_offsets_prefixes")]
+    fn py_encode_with_character_offsets_prefixes(
+        &self,
+        py: Python,
+        text: &str,
+        ends: Vec<usize>,
+        allowed_special: HashSet<PyBackedStr>,
+        max_tokens: usize,
+    ) -> PyResult<Py<PyList>> {
+        let rows = py.detach(|| {
+            let allowed: HashSet<&str> = allowed_special.iter().map(|s| s.as_ref()).collect();
+            self.encode_with_character_offsets_prefixes(text, &ends, &allowed, max_tokens)
+                .map_err(|e| PyErr::new::<exceptions::PyValueError, _>(e.message))
+        })?;
+        let result = PyList::empty(py);
+        let mut previous: Option<(Bound<'_, PyList>, Bound<'_, PyList>)> = None;
+        for (index, (ids, offsets)) in rows.iter().enumerate() {
+            let common = index.checked_sub(1).map_or(0, |prior| {
+                ids.iter()
+                    .zip(offsets)
+                    .zip(rows[prior].0.iter().zip(&rows[prior].1))
+                    .take_while(|(left, right)| left == right)
+                    .count()
+            });
+            let (py_ids, py_offsets) = if let Some((prior_ids, prior_offsets)) =
+                previous.as_ref().filter(|_| common > 0)
+            {
+                // Slices own independent lists; only immutable integer/tuple values are shared.
+                let py_ids = prior_ids.get_slice(0, common);
+                let py_offsets = prior_offsets.get_slice(0, common);
+                for id in &ids[common..] {
+                    py_ids.append(*id)?;
+                }
+                for offset in &offsets[common..] {
+                    py_offsets.append(*offset)?;
+                }
+                (py_ids, py_offsets)
+            } else {
+                (
+                    PyList::new(py, ids.iter().copied())?,
+                    PyList::new(py, offsets.iter().copied())?,
+                )
+            };
+            result.append((&py_ids, &py_offsets))?;
+            previous = Some((py_ids, py_offsets));
+        }
+        Ok(result.unbind())
+    }
+
+    /// Project fresh prefix offsets to the target bounds consumed by causal rows.
+    /// The consumer retains its existing ordered length/nonempty-target checks.
+    #[pyo3(name = "_encode_with_character_targets_prefixes")]
+    fn py_encode_with_character_targets_prefixes(
+        &self,
+        py: Python,
+        text: &str,
+        spans: Vec<(usize, usize)>,
+        allowed_special: HashSet<PyBackedStr>,
+        max_tokens: usize,
+    ) -> PyResult<Py<PyList>> {
+        let rows = py.detach(|| {
+            let allowed: HashSet<&str> = allowed_special.iter().map(|s| s.as_ref()).collect();
+            let ends: Vec<usize> = spans.iter().map(|span| span.1).collect();
+            self.encode_with_character_offsets_prefixes(text, &ends, &allowed, max_tokens)
+                .map(|rows| {
+                    rows.into_iter()
+                        .zip(&spans)
+                        .map(|((ids, offsets), &(start, stop))| {
+                            let first = offsets.partition_point(|span| span.1 <= start);
+                            let last = offsets.partition_point(|span| span.0 < stop);
+                            (ids, first, last)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .map_err(|e| PyErr::new::<exceptions::PyValueError, _>(e.message))
+        })?;
+        let result = PyList::empty(py);
+        let mut previous: Option<Bound<'_, PyList>> = None;
+        for (index, (ids, first, last)) in rows.iter().enumerate() {
+            let common = index.checked_sub(1).map_or(0, |prior| {
+                ids.iter()
+                    .zip(&rows[prior].0)
+                    .take_while(|(left, right)| left == right)
+                    .count()
+            });
+            let py_ids = if let Some(prior) = previous.as_ref().filter(|_| common > 0) {
+                let values = prior.get_slice(0, common);
+                for id in &ids[common..] {
+                    values.append(*id)?;
+                }
+                values
+            } else {
+                PyList::new(py, ids.iter().copied())?
+            };
+            result.append((&py_ids, *first, *last))?;
+            previous = Some(py_ids);
+        }
+        Ok(result.unbind())
     }
 
     #[pyo3(name = "count_tokens")]
@@ -645,17 +871,22 @@ fn _prepare_utf8(_texts: Vec<PyBackedStr>) {}
 
 #[pymodule(gil_used = false)]
 fn _tiktoken(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(crate::rmcp_model::_bounded_model_vocab, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        crate::rmcp_model::_bounded_model_vocab,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(crate::rmcp_model::_prove_model_words, m)?)?;
     m.add_function(wrap_pyfunction!(crate::rmcp_model::_model_word_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(crate::rmcp_model::_admit_model_words, m)?)?;
-
 
     m.add_class::<CoreBPE>()?;
     m.add_class::<TokenStorageEncoder>()?;
     m.add_class::<TokenStorageDecoder>()?;
     m.add_class::<TokenTierCodec>()?;
     m.add_function(wrap_pyfunction!(_prepare_utf8, m)?)?;
-    m.add_function(wrap_pyfunction!(crate::rmcp_token_bits::_unpack_bits17_into, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        crate::rmcp_token_bits::_unpack_bits17_into,
+        m
+    )?)?;
     Ok(())
 }

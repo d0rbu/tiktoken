@@ -31,6 +31,12 @@ byte length, so embedded or trailing zero bytes remain distinct. Longer keys kee
 their original byte-vector representation. This changes lookup storage only;
 token ranks, merge ordering, special tokens and decoding retain their meanings.
 
+RMCP prefix character-offset results remain ordinary, independently mutable Python
+lists. During one call, exact matching adjacent prefix entries can share only
+immutable Python integers and span tuples; the lists themselves remain separate.
+The native encoding, requested-prefix EOF and character-offset computations are
+unchanged, and no values are cached between calls.
+
 `tiktoken` is between 3-6x faster than a comparable open source tokeniser:
 
 ![image](https://raw.githubusercontent.com/openai/tiktoken/main/perf.svg)
@@ -151,3 +157,16 @@ Rust and Python regressions compare full-ID counts across Unicode boundaries,
 partial special policies, overlapping literals, incomplete vocabularies, invalid
 ranges, and empty registries. The RMCP consumer additionally qualifies the native
 binary against Hugging Face counts and exact public-selector artifacts.
+
+## RMCP independent prefix offsets
+
+The private `_encode_with_character_offsets_prefixes` binding returns complete
+ordinary token-ID and original character-offset lists for independent prefix ends
+in the supplied order. It returns through the first empty or over-limit prefix so
+the owning RMCP caller raises its original context-eligibility error first.
+
+For the exact guarded pattern it indexes complete pieces once and independently
+re-encodes each prefix's last two pieces at EOF. The same complete-byte vocabulary,
+full special-token policy, 64 KiB and amortized-work guards as range counting apply.
+Unsupported calls retain ordered scalar encoding, including native error behavior.
+No index or result is retained across calls; duplicate and unsorted ends are allowed.

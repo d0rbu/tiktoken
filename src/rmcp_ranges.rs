@@ -3,9 +3,78 @@
 
 use std::collections::HashSet;
 
-use crate::{CoreBPE, EncodeError, _byte_pair_encode, _byte_pair_merge};
+use crate::{_byte_pair_encode, _byte_pair_merge, CoreBPE, EncodeError};
 
 impl CoreBPE {
+    /// Complete independent prefixes reuse only stable guarded-pattern pieces.
+    /// The last two pieces are always re-encoded at each requested EOF.
+    pub(crate) fn try_encode_prefixes_indexed(
+        &self,
+        text: &str,
+        ends: &[usize],
+        allowed: &HashSet<&str>,
+        max_tokens: usize,
+    ) -> Option<Vec<Vec<crate::Rank>>> {
+        if self.regular_regex_tls.is_none()
+            || text.is_empty()
+            || text.len() > 65536
+            || ends.len() < 2
+            || self.special_tokens_encoder.is_empty()
+            || self.special_tokens_encoder.contains_key("")
+            || !self
+                .special_tokens_encoder
+                .keys()
+                .all(|s| allowed.contains(s.as_str()))
+        {
+            return None;
+        }
+        let work = ends.iter().try_fold(0usize, |sum, &end| {
+            text.get(..end)?;
+            sum.checked_add(end)
+        })?;
+        if work < 2 * text.len() || !(0..=255u8).all(|byte| self.encoder.contains_key(&[byte][..]))
+        {
+            return None;
+        }
+        let mut boundaries = Vec::new();
+        let mut token_ends = vec![0usize];
+        let mut tokens = Vec::new();
+        self.visit_count_pieces(text, allowed, |end, piece, special| {
+            if special {
+                tokens.push(self.special_tokens_encoder[piece]);
+            } else if let Some(token) = self.encoder.get(piece.as_bytes()) {
+                tokens.push(*token);
+            } else {
+                tokens.extend(_byte_pair_encode(piece.as_bytes(), &self.encoder));
+            }
+            boundaries.push(end);
+            token_ends.push(tokens.len());
+            true
+        })
+        .ok()?;
+        if boundaries.last().copied() != Some(text.len()) {
+            return None;
+        }
+        let mut rows = Vec::with_capacity(ends.len());
+        for &end in ends {
+            let last = boundaries.partition_point(|&boundary| boundary < end);
+            let suffix = last.saturating_sub(1);
+            let cut = if suffix == 0 {
+                0
+            } else {
+                boundaries[suffix - 1]
+            };
+            let mut row = tokens[..token_ends[suffix]].to_vec();
+            row.extend(self.encode(&text[cut..end], allowed).ok()?.0);
+            let stop = row.is_empty() || row.len() > max_tokens;
+            rows.push(row);
+            if stop {
+                break;
+            }
+        }
+        Some(rows)
+    }
+
     /// Visit the actual ordinary/special partitions, stopping when requested.
     /// A failed speculative visit is discarded in favor of the original API.
     fn visit_count_pieces(
@@ -213,9 +282,11 @@ mod tests {
                 .keys()
                 .all(|literal| allowed.contains(literal.as_str()))
         {
-            assert!(model
-                .try_count_ranges_indexed(text, &ranges, allowed)
-                .is_none());
+            assert!(
+                model
+                    .try_count_ranges_indexed(text, &ranges, allowed)
+                    .is_none()
+            );
         } else {
             assert_eq!(
                 model
@@ -284,10 +355,58 @@ mod tests {
                         Some(vec![expected; 8])
                     );
                 } else {
-                    assert!(model
-                        .try_count_ranges_indexed(&text, &ranges, &allowed)
-                        .is_none());
+                    assert!(
+                        model
+                            .try_count_ranges_indexed(&text, &ranges, &allowed)
+                            .is_none()
+                    );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn prefix_ids_match_scalar_eof_for_every_short_prefix() {
+        let model = core(include_str!("rmcp_pattern.txt"));
+        let allowed = model
+            .special_tokens_encoder
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let alphabet = ['a', 's', '\'', ' ', '\n', '!'];
+        let mut texts = vec![
+            "éS界😀\0 a\u{85}\u{2000}\r\n 're  ".to_owned(),
+            "ababa ababababab <S>long<T>abc".to_owned(),
+            "   aa\t\r\n \t a  'sfoo'rd!".to_owned(),
+        ];
+        for size in 1..=4u32 {
+            for mut code in 0..alphabet.len().pow(size) {
+                let mut text = String::new();
+                for _ in 0..size {
+                    text.push(alphabet[code % alphabet.len()]);
+                    code /= alphabet.len();
+                }
+                texts.push(text);
+            }
+        }
+        for text in texts {
+            let mut ends: Vec<_> = text
+                .char_indices()
+                .map(|(byte, _)| byte)
+                .filter(|&byte| byte > 0)
+                .chain([text.len(); 3])
+                .collect();
+            for _ in 0..2 {
+                let expected: Vec<_> = ends
+                    .iter()
+                    .map(|&end| model.encode(&text[..end], &allowed).unwrap().0)
+                    .collect();
+                assert_eq!(
+                    model.try_encode_prefixes_indexed(&text, &ends, &allowed, usize::MAX),
+                    Some(expected),
+                    "{text:?}"
+                );
+                ends.reverse();
             }
         }
     }
@@ -300,35 +419,47 @@ mod tests {
             .keys()
             .map(String::as_str)
             .collect();
-        assert!(model
-            .try_count_ranges_indexed("abc", &[(0, 3)], &allowed)
-            .is_none());
-        assert!(model
-            .try_count_ranges_indexed("abc", &[(0, 1); 2], &allowed)
-            .is_none());
+        assert!(
+            model
+                .try_count_ranges_indexed("abc", &[(0, 3)], &allowed)
+                .is_none()
+        );
+        assert!(
+            model
+                .try_count_ranges_indexed("abc", &[(0, 1); 2], &allowed)
+                .is_none()
+        );
         for invalid in [(0, 1), (1, 1), (2, 0), (0, 9)] {
-            assert!(model
-                .try_count_ranges_indexed("é", &[(0, 2), invalid], &allowed)
-                .is_none());
+            assert!(
+                model
+                    .try_count_ranges_indexed("é", &[(0, 2), invalid], &allowed)
+                    .is_none()
+            );
         }
         let text = "x".repeat(65537);
-        assert!(model
-            .try_count_ranges_indexed(&text, &[(0, text.len()); 2], &allowed)
-            .is_none());
+        assert!(
+            model
+                .try_count_ranges_indexed(&text, &[(0, text.len()); 2], &allowed)
+                .is_none()
+        );
         let incomplete = CoreBPE::new_internal(
             HashMap::from_iter([(b"a".to_vec(), 0)]),
             HashMap::from_iter([("<S>".to_owned(), 1)]),
             include_str!("rmcp_pattern.txt"),
         )
         .unwrap();
-        assert!(incomplete
-            .try_count_ranges_indexed("a!", &[(0, 1); 8], &allowed)
-            .is_none());
+        assert!(
+            incomplete
+                .try_count_ranges_indexed("a!", &[(0, 1); 8], &allowed)
+                .is_none()
+        );
         assert_eq!(incomplete.count_tokens("a", &allowed).unwrap(), 1);
         let arbitrary = core(r"[\s\S]+");
-        assert!(arbitrary
-            .try_count_ranges_indexed("abc", &[(0, 3); 8], &allowed)
-            .is_none());
+        assert!(
+            arbitrary
+                .try_count_ranges_indexed("abc", &[(0, 3); 8], &allowed)
+                .is_none()
+        );
     }
 
     #[test]
@@ -357,9 +488,11 @@ mod tests {
         let text = "ababa ababababab <S>long<T>abc";
         let ranges = [(0, text.len()), (0, 20), (0, text.len())];
         for allowed in [HashSet::new(), HashSet::from(["<S>", "aba", "éS"])] {
-            assert!(model
-                .try_count_ranges_indexed(text, &ranges, &allowed)
-                .is_none());
+            assert!(
+                model
+                    .try_count_ranges_indexed(text, &ranges, &allowed)
+                    .is_none()
+            );
         }
     }
 
@@ -369,18 +502,27 @@ mod tests {
             (0..=255u8).map(|byte| (vec![byte], byte as Rank)).collect(),
             HashMap::default(),
             include_str!("rmcp_pattern.txt"),
-        ).unwrap();
+        )
+        .unwrap();
         for allowed in [HashSet::new(), HashSet::from([""])] {
-            assert!(model.try_count_ranges_indexed("abc", &[(0, 3); 2], &allowed).is_none());
+            assert!(
+                model
+                    .try_count_ranges_indexed("abc", &[(0, 3); 2], &allowed)
+                    .is_none()
+            );
         }
         assert_eq!(model.count_tokens("abc", &HashSet::new()).unwrap(), 3);
         let zero_width = CoreBPE::new_internal(
             (0..=255u8).map(|byte| (vec![byte], byte as Rank)).collect(),
             HashMap::from_iter([("".to_owned(), 256)]),
             include_str!("rmcp_pattern.txt"),
-        ).unwrap();
+        )
+        .unwrap();
         // Its original scalar API can loop. The index must decline before visiting it.
-        assert!(zero_width.try_count_ranges_indexed("abc", &[(0, 3); 2], &HashSet::from([""])).is_none());
+        assert!(
+            zero_width
+                .try_count_ranges_indexed("abc", &[(0, 3); 2], &HashSet::from([""]))
+                .is_none()
+        );
     }
-
 }

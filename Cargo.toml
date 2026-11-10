@@ -12,7 +12,11 @@ default = []
 python = [
     "pyo3",
     "serde_json",
+    "serde",
+    "sonic-rs",
 ]
+sonic-rs = ["dep:sonic-rs"]
+serde = ["dep:serde"]
 
 [dependencies]
 pyo3 = { version = "0.29.2", default-features = false, features = [
@@ -29,9 +33,13 @@ rustc-hash = "2"
 bstr = "1.13.1"
 serde_json = { version = "1.0", features = ["raw_value"], optional = true }
 smallvec = { version = "=1.16.4", default-features = false, features = ["union"] }
+sonic-rs = { version = "=0.5.10", default-features = false, optional = true }
+serde = { version = "1", default-features = false, optional = true }
 
 [dev-dependencies]
+serde = { version = "1", default-features = false }
 serde_json = { version = "1.0", features = ["raw_value"] }
+sonic-rs = { version = "=0.5.10", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2.190"

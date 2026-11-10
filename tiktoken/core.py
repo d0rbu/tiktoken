@@ -61,6 +61,27 @@ class Encoding:
 
         self._core_bpe = _tiktoken.CoreBPE(mergeable_ranks, special_tokens, pat_str)
 
+    @classmethod
+    def _from_packed_ranks(
+        cls, name: str, *, pat_str: str, ranks: bytes, special_tokens: dict[str, int]
+    ) -> Encoding:
+        """Consume private producer-owned ranks without a Python dictionary round trip."""
+        encoding = cls.__new__(cls)
+        encoding.name = name
+        encoding._pat_str = pat_str
+        encoding._special_tokens = special_tokens
+        encoding._special_token_values = set(special_tokens.values())
+        encoding._core_bpe, encoding.max_token_value = (
+            _tiktoken.CoreBPE._from_packed_ranks(ranks, special_tokens, pat_str)
+        )
+        return encoding
+
+    @functools.cached_property
+    def _mergeable_ranks(self) -> dict[bytes, int]:
+        # The public constructor still assigns the caller's exact dictionary.
+        # Only the packed private constructor defers this diagnostic view.
+        return self._core_bpe._mergeable_ranks()
+
     def __repr__(self) -> str:
         return f"<Encoding {self.name!r}>"
 
@@ -166,7 +187,9 @@ class Encoding:
         buffer = self._core_bpe.encode_to_tiktoken_buffer(text, allowed_special)
         return np.frombuffer(buffer, dtype=np.uint32)
 
-    def encode_ordinary_batch(self, text: list[str], *, num_threads: int = 8) -> list[list[int]]:
+    def encode_ordinary_batch(
+        self, text: list[str], *, num_threads: int = 8
+    ) -> list[list[int]]:
         """Encodes a list of strings into tokens, in parallel, ignoring special tokens.
 
         This is equivalent to `encode_batch(text, disallowed_special=())` (but slightly faster).
@@ -205,7 +228,9 @@ class Encoding:
             disallowed_special = frozenset(disallowed_special)
 
         encoder = functools.partial(
-            self.encode, allowed_special=allowed_special, disallowed_special=disallowed_special
+            self.encode,
+            allowed_special=allowed_special,
+            disallowed_special=disallowed_special,
         )
         with ThreadPoolExecutor(num_threads) as e:
             return list(e.map(encoder, text))
@@ -340,7 +365,11 @@ class Encoding:
         return text, offsets
 
     def decode_batch(
-        self, batch: Sequence[Sequence[int]], *, errors: str = "replace", num_threads: int = 8
+        self,
+        batch: Sequence[Sequence[int]],
+        *,
+        errors: str = "replace",
+        num_threads: int = 8,
     ) -> list[str]:
         """Decodes a batch (list of lists of tokens) into a list of strings."""
         decoder = functools.partial(self.decode, errors=errors)
