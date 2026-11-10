@@ -158,16 +158,21 @@ fn _byte_pair_merge_large(ranks: &impl RankLookup, piece: &[u8]) -> Vec<Rank> {
 
 fn _byte_pair_merge(ranks: &impl RankLookup, piece: &[u8]) -> Vec<(usize, Rank)> {
     let mut parts = Vec::with_capacity(piece.len() + 1);
-    _byte_pair_merge_into(ranks, piece, &mut parts, |pair| {
-        *ranks.get(pair).unwrap_or(&Rank::MAX)
-    });
+    _byte_pair_merge_into(
+        ranks,
+        piece,
+        &mut parts,
+        |start| start,
+        |pair| *ranks.get(pair).unwrap_or(&Rank::MAX),
+    );
     parts
 }
 
-fn _byte_pair_merge_into(
+fn _byte_pair_merge_into<Offset: Copy + Into<usize>>(
     ranks: &impl RankLookup,
     piece: &[u8],
-    parts: &mut Vec<(usize, Rank)>,
+    parts: &mut Vec<(Offset, Rank)>,
+    offset: impl Fn(usize) -> Offset,
     pair_rank: impl Fn(&[u8]) -> Rank,
 ) {
     // Reuse only this encode call's scratch; starts and ranks never carry over.
@@ -185,19 +190,19 @@ fn _byte_pair_merge_into(
         if rank < min_rank.0 {
             min_rank = (rank, i);
         }
-        parts.push((i, rank));
+        parts.push((offset(i), rank));
     }
-    parts.push((piece.len() - 1, Rank::MAX));
-    parts.push((piece.len(), Rank::MAX));
+    parts.push((offset(piece.len() - 1), Rank::MAX));
+    parts.push((offset(piece.len()), Rank::MAX));
 
     let get_rank = {
         #[inline(always)]
-        |parts: &Vec<(usize, Rank)>, i: usize| {
+        |parts: &Vec<(Offset, Rank)>, i: usize| {
             if (i + 3) < parts.len() {
                 // Similar to `piece[i..i + 2]` above. The +3 is because we haven't yet deleted
                 // parts[i + 1], see comment in the main loop.
                 *ranks
-                    .get_span(piece, parts[i].0, parts[i + 3].0)
+                    .get_span(piece, parts[i].0.into(), parts[i + 3].0.into())
                     .unwrap_or(&Rank::MAX)
             } else {
                 Rank::MAX
@@ -713,7 +718,9 @@ impl CoreBPE {
     ) -> Result<(Vec<Rank>, usize, usize), EncodeError> {
         let special_regex = self._get_tl_special_regex();
         let mut ret = vec![];
-        let mut parts = Vec::new();
+        // This scratch is used only for pieces shorter than 100 bytes. Compact
+        // offsets halve each (start, rank) entry without changing merge order.
+        let mut parts: Vec<(u8, Rank)> = Vec::new();
         // Only this document owns these borrowed keys and output indices.
         let mut reused: HashMap<&[u8], (usize, usize)> = HashMap::default();
         let mut count = 0;
@@ -770,9 +777,13 @@ impl CoreBPE {
                 }
                 let output_start = ret.len();
                 if piece.len() > 1 && piece.len() < 100 {
-                    _byte_pair_merge_into(&self.encoder, piece, &mut parts, |pair| {
-                        self.pair_ranks[pair_index(pair[0], pair[1])]
-                    });
+                    _byte_pair_merge_into(
+                        &self.encoder,
+                        piece,
+                        &mut parts,
+                        |start| start as u8,
+                        |pair| self.pair_ranks[pair_index(pair[0], pair[1])],
+                    );
                     last_piece_token_len = parts.len() - 1;
                     if COUNT_ONLY {
                         count += last_piece_token_len;
@@ -780,7 +791,7 @@ impl CoreBPE {
                         ret.extend(parts.windows(2).map(|part| {
                             *self
                                 .encoder
-                                .get_span(piece, part[0].0, part[1].0)
+                                .get_span(piece, usize::from(part[0].0), usize::from(part[1].0))
                                 .expect("no entry found for key")
                         }));
                     }
@@ -1508,6 +1519,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn compact_merge_offsets_match_frozen_original_for_all_short_lengths() {
+        assert_eq!(std::mem::size_of::<(u8, Rank)>(), 8);
+        assert_eq!(std::mem::size_of::<(usize, Rank)>(), 16);
+        let mut state = 771_u64;
+        let mut compact = Vec::new();
+        let mut expected = Vec::new();
+        for trial in 0..6 {
+            let mut bytes = Vec::new();
+            for _ in 0..320 {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                bytes.push(((state >> 32) % 13) as u8);
+            }
+            let mut original: HashMap<Vec<u8>, Rank> =
+                (0..=255_u32).map(|byte| (vec![byte as u8], byte)).collect();
+            for width in 2..=12 {
+                for (index, span) in bytes.windows(width).enumerate() {
+                    if (index + width + trial) % 3 != 0 {
+                        original
+                            .entry(span.to_vec())
+                            .or_insert((index % 97) as Rank);
+                    }
+                }
+            }
+            let ranks = crate::rmcp_ranks::EncoderRanks::from(original.clone());
+            for length in (2..100).rev() {
+                let piece = &bytes[..length];
+                crate::frozen_merge_into(&original, piece, &mut expected, |pair| {
+                    *original.get(pair).unwrap_or(&Rank::MAX)
+                });
+                crate::_byte_pair_merge_into(
+                    &ranks,
+                    piece,
+                    &mut compact,
+                    |i| i as u8,
+                    |pair| *original.get(pair).unwrap_or(&Rank::MAX),
+                );
+                let expanded: Vec<_> = compact
+                    .iter()
+                    .map(|&(start, rank)| (usize::from(start), rank))
+                    .collect();
+                assert_eq!(expanded, expected, "trial={trial},length={length}");
+            }
+            for length in [100, 255, 256, 320] {
+                let piece = &bytes[..length];
+                crate::frozen_merge_into(&original, piece, &mut expected, |pair| {
+                    *original.get(pair).unwrap_or(&Rank::MAX)
+                });
+                assert_eq!(crate::_byte_pair_merge(&ranks, piece), expected);
+            }
+        }
+    }
+
     fn setup_ranks() -> HashMap<Vec<u8>, Rank> {
         HashMap::from_iter([(b"ab".to_vec(), 0), (b"cd".to_vec(), 1)])
     }
@@ -1524,5 +1588,70 @@ mod tests {
         let ranks = setup_ranks();
         let res = byte_pair_split(b"abab", &ranks);
         assert_eq!(res, vec![b"ab", b"ab"]);
+    }
+}
+
+#[cfg(test)]
+fn frozen_merge_into(
+    ranks: &impl RankLookup,
+    piece: &[u8],
+    parts: &mut Vec<(usize, Rank)>,
+    pair_rank: impl Fn(&[u8]) -> Rank,
+) {
+    // Reuse only this encode call's scratch; starts and ranks never carry over.
+    parts.clear();
+    parts.reserve(piece.len() + 1);
+    // This is a vector of (start, rank).
+    // The rank is of the pair starting at position start.
+
+    // Note that we hash bytes when indexing into `ranks`, not token pairs. As long as we train BPE
+    // the way we currently do, this is equivalent. An easy way to break this would be to decouple
+    // merge priority from token index or to prevent specific token merges.
+    let mut min_rank: (Rank, usize) = (Rank::MAX, usize::MAX);
+    for i in 0..piece.len() - 1 {
+        let rank = pair_rank(&piece[i..i + 2]);
+        if rank < min_rank.0 {
+            min_rank = (rank, i);
+        }
+        parts.push((i, rank));
+    }
+    parts.push((piece.len() - 1, Rank::MAX));
+    parts.push((piece.len(), Rank::MAX));
+
+    let get_rank = {
+        #[inline(always)]
+        |parts: &Vec<(usize, Rank)>, i: usize| {
+            if (i + 3) < parts.len() {
+                // Similar to `piece[i..i + 2]` above. The +3 is because we haven't yet deleted
+                // parts[i + 1], see comment in the main loop.
+                *ranks
+                    .get_span(piece, parts[i].0, parts[i + 3].0)
+                    .unwrap_or(&Rank::MAX)
+            } else {
+                Rank::MAX
+            }
+        }
+    };
+
+    // If you have n parts and m merges, this does O(mn) work.
+    // We could do something with a heap and do O(m log n) work.
+    // n is often very small so considerations like cache-locality outweigh the algorithmic
+    // complexity downsides of the `parts` vector.
+    while min_rank.0 != Rank::MAX {
+        let i = min_rank.1;
+        // Update parts[i] and parts[i - 1] before removing parts[i + 1], since
+        // `parts.remove(i + 1)` will thrash the cache.
+        if i > 0 {
+            parts[i - 1].1 = get_rank(parts, i - 1);
+        }
+        parts[i].1 = get_rank(parts, i);
+        parts.remove(i + 1);
+
+        min_rank = (Rank::MAX, usize::MAX);
+        for (i, &(_, rank)) in parts[..parts.len() - 1].iter().enumerate() {
+            if rank < min_rank.0 {
+                min_rank = (rank, i);
+            }
+        }
     }
 }
