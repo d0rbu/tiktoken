@@ -77,3 +77,32 @@ def test_shared_model_independent_calls() -> None:
             pool.map(lambda text: core._encode_with_character_offsets(text, allowed), inputs)
         )
     assert actual == [expected(core, decoder, text, allowed) for text in inputs]
+
+
+@settings(max_examples=200, deadline=None)
+@given(
+    st.text(st.characters(exclude_categories=("Cs",)), max_size=100),
+    st.sets(st.sampled_from(("<S>", "<T>", "<é😀>"))),
+)
+@pytest.mark.parametrize("tail", ["", "abc", "é<S>😀<T><é😀>"])
+def test_sparse_cut_answers_match_literal_offsets(tail: str, text: str, allowed: set[str]) -> None:
+    core, decoder = model()
+    text += tail
+    ids, spans = expected(core, decoder, text, allowed)
+    ends = [cut for cut in range(len(text) + 1) for _ in range(2)]
+    answers = []
+    for cut in ends:
+        started = sum(start < cut for start, _ in spans)
+        completed = sum(end <= cut for _, end in spans)
+        answers.append(completed if started == completed else None)
+    assert core._encode_with_character_cuts(text, ends, allowed) == (len(ids), answers)
+
+
+def test_sparse_cut_answers_decline_invalid_queries_and_aliased_decoders() -> None:
+    core, _ = model()
+    assert core._encode_with_character_cuts("abc", [2, 1], set()) is None
+    assert core._encode_with_character_cuts("é", [2], set()) is None
+    assert core._encode_with_character_cuts("", [], set()) == (0, [])
+    ranks = {bytes([value]): value for value in range(256)}
+    aliased = _tiktoken.CoreBPE(ranks, {"<S>": 97}, r"[\s\S]+")
+    assert aliased._encode_with_character_cuts("a<S>", [1, 4], {"<S>"}) is None

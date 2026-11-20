@@ -450,6 +450,57 @@ impl CoreBPE {
         Ok((tokens, offsets))
     }
 
+    /// Return sparse cut answers for an exact-decoding identity-offset model.
+    #[cfg(any(feature = "python", test))]
+    fn encode_with_character_cuts(
+        &self,
+        text: &str,
+        ends: &[usize],
+        allowed_special: &HashSet<&str>,
+    ) -> Result<Option<(usize, Vec<Option<usize>>)>, EncodeError> {
+        if !self.exact_target_decoder {
+            return Ok(None);
+        }
+        let mut previous = 0;
+        let mut bytes = 0;
+        let mut characters = text.chars();
+        let mut byte_cuts = Vec::with_capacity(ends.len());
+        for &end in ends {
+            let Some(delta) = end.checked_sub(previous) else {
+                return Ok(None);
+            };
+            for _ in 0..delta {
+                let Some(character) = characters.next() else {
+                    return Ok(None);
+                };
+                bytes += character.len_utf8();
+            }
+            byte_cuts.push(bytes);
+            previous = end;
+        }
+
+        let (tokens, _) = self.encode(text, allowed_special)?;
+        let mut consumed = 0;
+        let mut byte_end = 0;
+        let mut answers = Vec::with_capacity(ends.len());
+        for cut in byte_cuts {
+            while byte_end < cut {
+                let Some(token) = tokens.get(consumed) else {
+                    return Ok(None);
+                };
+                byte_end += self
+                    .special_tokens_decoder
+                    .get(token)
+                    .or_else(|| self.decoder.get(token))
+                    .expect("encoded token has a decoder entry")
+                    .len();
+                consumed += 1;
+            }
+            answers.push((byte_end == cut).then_some(consumed));
+        }
+        Ok(Some((tokens.len(), answers)))
+    }
+
     #[cfg(any(feature = "python", test))]
     fn character_offsets(&self, text: &str, tokens: &[Rank]) -> Vec<(usize, usize)> {
         let mut character_starts = text.char_indices().map(|(byte, _)| byte).peekable();

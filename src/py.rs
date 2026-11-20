@@ -515,6 +515,21 @@ impl CoreBPE {
         })
     }
 
+    #[pyo3(name = "_encode_with_character_cuts")]
+    fn py_encode_with_character_cuts(
+        &self,
+        py: Python,
+        text: &str,
+        ends: Vec<usize>,
+        allowed_special: HashSet<PyBackedStr>,
+    ) -> PyResult<Option<(usize, Vec<Option<usize>>)>> {
+        py.detach(|| {
+            let allowed = allowed_special.iter().map(|s| s.as_ref()).collect();
+            self.encode_with_character_cuts(text, &ends, &allowed)
+                .map_err(|e| PyErr::new::<exceptions::PyValueError, _>(e.message))
+        })
+    }
+
     #[pyo3(name = "_encode_with_character_offsets_prefixes")]
     fn py_encode_with_character_offsets_prefixes(
         &self,

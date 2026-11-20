@@ -1,3 +1,21 @@
+## Sparse legal source cuts (`0.14.0+rmcp.133.sourcecuts1`)
+
+The private `CoreBPE._encode_with_character_cuts(text, ends, allowed_special)`
+returns the complete original token count and one token-count answer for each
+requested character end. A crossed cut has a null answer. An ordered byte
+cursor projects only the requested cuts after the existing complete encode.
+The caller retains physical offset filtering and tokenizer warning behavior.
+Repeated cut coordinates are supported. Invalid query order, out-of-range
+coordinates and aliased decoders decline to the original offset path.
+
+A matched private RMCP overlay replay processed 38,835,512 output IDs per
+command with exact token, cut, span, manifest, file mode and warning parity.
+Eight AB/BA pairs per worker setup gave complete-command wall speedups of
+1.435× at one worker and 1.173× at four workers. All 32 samples and their
+reference runs were retained as proofs, and generated arrays expired. The
+production defensive bounds retain the measured algorithm. A dependency-pinned
+RMCP comparison and full integration gate are required before adoption.
+
 ## Shared prefix offset projection (`0.14.0+rmcp.132.offsetprefixreuse1`)
 
 The private character-offset prefix encoder reuses only identical token prefixes
