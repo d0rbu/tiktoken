@@ -1,3 +1,19 @@
+## Reuse original token interiors in reflected preparation
+
+The private reflection encoder accepts rendered character coordinates and
+lends original token IDs to physical source interiors at independently
+admissible cuts. Source edges and feedback fragments still encode
+independently. The existing exact pretokenizer admission binds the whitespace
+rule. Unsupported patterns, whitespace-bearing allowed specials and
+unmatchable source fragments decline the native route so the caller can use
+its existing encoding path.
+
+The native result delivers independently owned source and physical token
+buffers, original byte ends, and physical token ends. RMCP uses the source
+buffer for rank projection and length warnings. Physical packing retains its
+own buffer when the source buffer goes out of scope.
+
+
 ## Pack independent fragments into one native token buffer
 
 The private packed-batch method returns a read-only token buffer and the

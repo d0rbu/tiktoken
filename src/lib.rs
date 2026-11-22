@@ -13,6 +13,8 @@ mod py;
 mod rmcp_model;
 #[cfg(any(feature = "python", test))]
 mod rmcp_ranges;
+#[cfg(any(feature = "python", test))]
+mod rmcp_reflection;
 mod rmcp_ranks;
 mod rmcp_regex;
 use rmcp_ranks::{EncoderRanks, RankLookup};
@@ -728,23 +730,25 @@ impl CoreBPE {
     ) -> Result<(Vec<Rank>, usize, usize), EncodeError> {
         let mut tokens = Vec::new();
         reused.clear();
-        let (last_piece, count) = self.encode_into_workspace::<COUNT_ONLY>(
+        let (last_piece, count) = self.encode_into_workspace::<COUNT_ONLY, _>(
             text,
             allowed_special,
             parts,
             reused,
             &mut tokens,
+            |_, _| {},
         )?;
         Ok((tokens, last_piece, count))
     }
 
-    fn encode_into_workspace<'a, const COUNT_ONLY: bool>(
+    fn encode_into_workspace<'a, const COUNT_ONLY: bool, F: FnMut(usize, usize)>(
         &'a self,
         text: &'a str,
         allowed_special: &HashSet<&str>,
         parts: &mut Vec<(usize, Rank)>,
         reused: &mut HashMap<&'a [u8], (usize, usize)>,
         ret: &mut Vec<Rank>,
+        mut record: F,
     ) -> Result<(usize, usize), EncodeError> {
         let special_regex = self._get_tl_special_regex();
         let mut count = 0;
@@ -782,6 +786,7 @@ impl CoreBPE {
 
                 let piece = piece.as_bytes();
                 let piece_start = piece.as_ptr() as usize - text.as_ptr() as usize;
+                record(piece_start, ret.len());
                 if let Some(token) =
                     self.encoder
                         .get_span(text.as_bytes(), piece_start, piece_start + piece.len())
@@ -835,6 +840,7 @@ impl CoreBPE {
             match next_special {
                 // And here we push the special token
                 Some(m) => {
+                    record(m.start(), ret.len());
                     let piece = m.as_str();
                     let token = self.special_tokens_encoder[piece];
                     if COUNT_ONLY {
@@ -888,12 +894,13 @@ impl CoreBPE {
         // inputs and append-only output. Every text still gets its own regex scan.
         let mut reused = HashMap::default();
         for text in texts {
-            self.encode_into_workspace::<false>(
+            self.encode_into_workspace::<false, _>(
                 text,
                 allowed_special,
                 &mut parts,
                 &mut reused,
                 &mut tokens,
+                |_, _| {},
             )?;
             ends.push(tokens.len());
         }
