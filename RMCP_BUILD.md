@@ -1,3 +1,18 @@
+## Reuse native encoding scratch within a batch
+
+The serial native batch encoder retains its merge workspace and piece lookup
+allocation across fragments. The lookup entries clear before each fragment so
+they always refer to that fragment's independent token vector. Single-text
+and count calls keep their call-local scratch. The tokenizer still visits
+fragments in order and reports the first encode error.
+
+Two installed CPU replay sessions prepared 1,008 prefix-and-suffix documents
+with 4,854,439 tokens. All 56 preparations produced the same 11 files and
+cache-reuse receipt. Warning messages matched in each paired run. The candidate
+won 11 of 14 one-worker wall-time pairs. The paired median ratio was 0.915 with
+a 95% bootstrap interval of 0.837–0.972. The two-worker paired median was
+0.981 with an interval of 0.924–1.063.
+
 ## Shared prefix offset projection (`0.14.0+rmcp.132.offsetprefixreuse1`)
 
 The private character-offset prefix encoder reuses only identical token prefixes
