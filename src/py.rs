@@ -705,6 +705,22 @@ impl CoreBPE {
             .collect()
     }
 
+    fn _encode_packed_token_buffer(
+        &self,
+        py: Python,
+        texts: Vec<PyBackedStr>,
+        allowed_special: HashSet<PyBackedStr>,
+    ) -> PyResult<(Py<PyAny>, Vec<usize>)> {
+        let (tokens, ends) = py
+            .detach(|| {
+                let allowed: HashSet<&str> =
+                    allowed_special.iter().map(|text| text.as_ref()).collect();
+                self.encode_batch_packed(texts.iter().map(|text| text.as_ref()), &allowed)
+            })
+            .map_err(|error| PyErr::new::<exceptions::PyValueError, _>(error.message))?;
+        Ok((TiktokenBuffer::new(tokens).into_py_any(py)?, ends))
+    }
+
     fn _encode_bytes(&self, py: Python, bytes: &[u8]) -> Vec<Rank> {
         py.detach(|| {
             match std::str::from_utf8(bytes) {

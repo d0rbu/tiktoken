@@ -474,6 +474,56 @@ impl CoreBPE {
         offsets
     }
 
+    /// Reuse only identical prefix coordinates inside one exact-decoder operation.
+    #[cfg(any(feature = "python", test))]
+    fn indexed_prefix_offsets(
+        &self,
+        text: &str,
+        rows: Vec<Vec<Rank>>,
+        boundaries: &[usize],
+    ) -> Vec<(Vec<Rank>, Vec<(usize, usize)>)> {
+        let mut characters = Vec::with_capacity(text.len() + 1);
+        for (index, pair) in boundaries.windows(2).enumerate() {
+            characters.resize(pair[1], index);
+        }
+        characters.push(boundaries.len() - 1);
+        let mut byte_ends = vec![0usize];
+        let mut result: Vec<(Vec<Rank>, Vec<(usize, usize)>)> = Vec::with_capacity(rows.len());
+        for ids in rows {
+            let prior = result.last();
+            let common = prior.map_or(0, |(previous_ids, _)| {
+                ids.iter()
+                    .zip(previous_ids)
+                    .take_while(|(a, b)| a == b)
+                    .count()
+            });
+            let mut offsets = Vec::with_capacity(ids.len());
+            if let Some((_, previous_offsets)) = prior {
+                offsets.extend_from_slice(&previous_offsets[..common]);
+            }
+            // Exact decoders give identical byte ends and character spans for
+            // identical token prefixes, even when the next requested EOF shrinks.
+            byte_ends.truncate(common + 1);
+            let mut byte_start = byte_ends[common];
+            for token in &ids[common..] {
+                let bytes = self
+                    .special_tokens_decoder
+                    .get(token)
+                    .or_else(|| self.decoder.get(token))
+                    .expect("encoded token has a decoder entry");
+                let byte_end = byte_start + bytes.len();
+                offsets.push((
+                    characters[byte_start],
+                    characters[byte_end] + usize::from(!text.is_char_boundary(byte_end)),
+                ));
+                byte_ends.push(byte_end);
+                byte_start = byte_end;
+            }
+            result.push((ids, offsets));
+        }
+        result
+    }
+
     /// Character-coordinate prefix ends; return through the first ineligible prefix.
     #[cfg(any(feature = "python", test))]
     fn encode_with_character_offsets_prefixes(
@@ -496,6 +546,9 @@ impl CoreBPE {
             if let Some(rows) =
                 self.try_encode_prefixes_indexed(text, &byte_ends, allowed, max_tokens)
             {
+                if self.exact_target_decoder && rows.len() > 1 {
+                    return Ok(self.indexed_prefix_offsets(text, rows, &boundaries));
+                }
                 return Ok(rows
                     .into_iter()
                     .zip(byte_ends)
@@ -658,11 +711,42 @@ impl CoreBPE {
         text: &str,
         allowed_special: &HashSet<&str>,
     ) -> Result<(Vec<Rank>, usize, usize), EncodeError> {
+        self.encode_with_workspace::<COUNT_ONLY>(
+            text,
+            allowed_special,
+            &mut Vec::new(),
+            &mut HashMap::default(),
+        )
+    }
+
+    fn encode_with_workspace<'a, const COUNT_ONLY: bool>(
+        &'a self,
+        text: &'a str,
+        allowed_special: &HashSet<&str>,
+        parts: &mut Vec<(usize, Rank)>,
+        reused: &mut HashMap<&'a [u8], (usize, usize)>,
+    ) -> Result<(Vec<Rank>, usize, usize), EncodeError> {
+        let mut tokens = Vec::new();
+        reused.clear();
+        let (last_piece, count) = self.encode_into_workspace::<COUNT_ONLY>(
+            text,
+            allowed_special,
+            parts,
+            reused,
+            &mut tokens,
+        )?;
+        Ok((tokens, last_piece, count))
+    }
+
+    fn encode_into_workspace<'a, const COUNT_ONLY: bool>(
+        &'a self,
+        text: &'a str,
+        allowed_special: &HashSet<&str>,
+        parts: &mut Vec<(usize, Rank)>,
+        reused: &mut HashMap<&'a [u8], (usize, usize)>,
+        ret: &mut Vec<Rank>,
+    ) -> Result<(usize, usize), EncodeError> {
         let special_regex = self._get_tl_special_regex();
-        let mut ret = vec![];
-        let mut parts = Vec::new();
-        // Only this document owns these borrowed keys and output indices.
-        let mut reused: HashMap<&[u8], (usize, usize)> = HashMap::default();
         let mut count = 0;
 
         let mut start = 0;
@@ -717,7 +801,7 @@ impl CoreBPE {
                 }
                 let output_start = ret.len();
                 if piece.len() > 1 && piece.len() < 100 {
-                    _byte_pair_merge_into(&self.encoder, piece, &mut parts, |pair| {
+                    _byte_pair_merge_into(&self.encoder, piece, parts, |pair| {
                         self.pair_ranks[pair_index(pair[0], pair[1])]
                     });
                     last_piece_token_len = parts.len() - 1;
@@ -767,21 +851,53 @@ impl CoreBPE {
 
         // last_piece_token_len is how many tokens came from the last regex split. This is used
         // for determining unstable tokens, since you can't merge across (stable) regex splits
-        Ok((ret, last_piece_token_len, count))
+        Ok((last_piece_token_len, count))
     }
 
     #[cfg(any(feature = "python", test))]
     fn encode_batch_serial<'a>(
-        &self,
+        &'a self,
         texts: impl Iterator<Item = &'a str>,
         allowed_special: &HashSet<&str>,
     ) -> Result<Vec<Vec<Rank>>, EncodeError> {
         let mut rows = Vec::with_capacity(texts.size_hint().0);
+        let mut parts = Vec::new();
+        let mut reused = HashMap::default();
         for text in texts {
-            let (tokens, _) = self.encode(text, allowed_special)?;
+            let (tokens, _, _) = self.encode_with_workspace::<false>(
+                text,
+                allowed_special,
+                &mut parts,
+                &mut reused,
+            )?;
             rows.push(tokens);
         }
         Ok(rows)
+    }
+
+    #[cfg(any(feature = "python", test))]
+    fn encode_batch_packed<'a>(
+        &'a self,
+        texts: impl Iterator<Item = &'a str>,
+        allowed_special: &HashSet<&str>,
+    ) -> Result<(Vec<Rank>, Vec<usize>), EncodeError> {
+        let mut ends = Vec::with_capacity(texts.size_hint().0);
+        let mut tokens = Vec::new();
+        let mut parts = Vec::new();
+        // Each borrowed piece and cached index remains valid in this batch's
+        // inputs and append-only output. Every text still gets its own regex scan.
+        let mut reused = HashMap::default();
+        for text in texts {
+            self.encode_into_workspace::<false>(
+                text,
+                allowed_special,
+                &mut parts,
+                &mut reused,
+                &mut tokens,
+            )?;
+            ends.push(tokens.len());
+        }
+        Ok((tokens, ends))
     }
 
     fn _increase_last_piece_token_len(
@@ -1309,6 +1425,26 @@ mod owned_batch_tests {
         assert_ne!(rows[1].as_ptr(), rows[2].as_ptr());
         rows[1][0] = 7;
         assert_eq!(rows[2], [256]);
+    }
+
+    #[test]
+    fn packed_batch_preserves_scalar_boundaries_with_repeated_pieces() {
+        let texts = ["", "abacba", "b", "abacba", "a", "<S>é😀", "", "<T>abacba"];
+        for pattern in [include_str!("rmcp_pattern.txt"), r"[\s\S]+"] {
+            let model = core(pattern);
+            for allowed in [HashSet::new(), HashSet::from(["<S>", "<T>"])] {
+                let (tokens, ends) = model
+                    .encode_batch_packed(texts.into_iter(), &allowed)
+                    .unwrap();
+                assert_eq!(ends.len(), texts.len());
+                let mut start = 0;
+                for (text, end) in texts.into_iter().zip(ends) {
+                    assert_eq!(tokens[start..end], model.encode(text, &allowed).unwrap().0);
+                    start = end;
+                }
+                assert_eq!(start, tokens.len());
+            }
+        }
     }
 
     #[test]
