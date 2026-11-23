@@ -1,3 +1,18 @@
+## Pack independent fragments into one native token buffer
+
+The private packed-batch method returns a read-only token buffer and the
+cumulative token end of each input fragment. Each fragment still gets its own
+regex scan and exact allowed-special matching. The append-only output lets the
+existing piece memo reuse identical BPE results within the batch. The memo
+and merge storage belong to that call. The original batch method still
+returns one independent buffer per input.
+
+In the installed RMCP prototype the combined workspace and packed-output
+changes reduced paired wall time by about 12% with one or two workers on
+1,008 retained prefix-and-suffix documents. Each setting won five of six
+matched pairs. All 24 preparations produced identical bytes across 11 files,
+and the warning messages matched within each pair.
+
 ## Reuse native encoding scratch within a batch
 
 The serial native batch encoder retains its merge workspace and piece lookup

@@ -37,6 +37,24 @@ def test_owned_batch_matches_scalar_document_bytes(allowed: frozenset[str]) -> N
     assert expected[3].tolist() == [256]
 
 
+@pytest.mark.parametrize("allowed", [frozenset(), frozenset({"<S>", "<T>"})])
+def test_packed_batch_keeps_independent_cuts_and_a_readonly_owner(allowed: frozenset[str]) -> None:
+    model = core()
+    texts = ("", "a", "b", "abcab", "abcab", "<S>é😀", "", "<T>ab")
+    expected = [model.encode(text, allowed) for text in texts]
+    buffer, ends = model._encode_packed_token_buffer(texts, allowed)
+    tokens = np.frombuffer(buffer, dtype=np.uint32)
+    assert ends == np.cumsum([len(row) for row in expected]).tolist()
+    assert tokens.tolist() == [token for row in expected for token in row]
+    empty_buffer, empty_ends = model._encode_packed_token_buffer((), allowed)
+    assert not empty_ends and memoryview(empty_buffer).nbytes == 0
+    del buffer, model
+    gc.collect()
+    assert tokens.tolist() == [token for row in expected for token in row]
+    with pytest.raises(ValueError, match="read-only"):
+        tokens[0] = 7
+
+
 def test_owned_batch_preserves_empty_batch_and_empty_documents() -> None:
     model = core()
     assert model.encode_to_tiktoken_buffers((), frozenset()) == []
@@ -67,6 +85,8 @@ def test_owned_batch_rejects_invalid_text_without_lossy_replacement(invalid: str
         model.encode_to_tiktoken_buffer(invalid, frozenset())
     with pytest.raises(type(scalar.value)):
         model.encode_to_tiktoken_buffers(("ab", invalid, "later"), frozenset())
+    with pytest.raises(type(scalar.value)):
+        model._encode_packed_token_buffer(("ab", invalid, "later"), frozenset())
     # The model remains usable after argument extraction fails. The RMCP caller
     # preflights the whole frame for surrogates before invoking this private API.
     row = model.encode_to_tiktoken_buffers(("ab",), frozenset())[0]
