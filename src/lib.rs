@@ -711,11 +711,25 @@ impl CoreBPE {
         text: &str,
         allowed_special: &HashSet<&str>,
     ) -> Result<(Vec<Rank>, usize, usize), EncodeError> {
+        self.encode_with_workspace::<COUNT_ONLY>(
+            text,
+            allowed_special,
+            &mut Vec::new(),
+            &mut HashMap::default(),
+        )
+    }
+
+    fn encode_with_workspace<'a, const COUNT_ONLY: bool>(
+        &'a self,
+        text: &'a str,
+        allowed_special: &HashSet<&str>,
+        parts: &mut Vec<(usize, Rank)>,
+        reused: &mut HashMap<&'a [u8], (usize, usize)>,
+    ) -> Result<(Vec<Rank>, usize, usize), EncodeError> {
         let special_regex = self._get_tl_special_regex();
         let mut ret = vec![];
-        let mut parts = Vec::new();
-        // Only this document owns these borrowed keys and output indices.
-        let mut reused: HashMap<&[u8], (usize, usize)> = HashMap::default();
+        // Cached indices always refer to this row's output vector.
+        reused.clear();
         let mut count = 0;
 
         let mut start = 0;
@@ -770,7 +784,7 @@ impl CoreBPE {
                 }
                 let output_start = ret.len();
                 if piece.len() > 1 && piece.len() < 100 {
-                    _byte_pair_merge_into(&self.encoder, piece, &mut parts, |pair| {
+                    _byte_pair_merge_into(&self.encoder, piece, parts, |pair| {
                         self.pair_ranks[pair_index(pair[0], pair[1])]
                     });
                     last_piece_token_len = parts.len() - 1;
@@ -825,13 +839,20 @@ impl CoreBPE {
 
     #[cfg(any(feature = "python", test))]
     fn encode_batch_serial<'a>(
-        &self,
+        &'a self,
         texts: impl Iterator<Item = &'a str>,
         allowed_special: &HashSet<&str>,
     ) -> Result<Vec<Vec<Rank>>, EncodeError> {
         let mut rows = Vec::with_capacity(texts.size_hint().0);
+        let mut parts = Vec::new();
+        let mut reused = HashMap::default();
         for text in texts {
-            let (tokens, _) = self.encode(text, allowed_special)?;
+            let (tokens, _, _) = self.encode_with_workspace::<false>(
+                text,
+                allowed_special,
+                &mut parts,
+                &mut reused,
+            )?;
             rows.push(tokens);
         }
         Ok(rows)
