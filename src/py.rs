@@ -939,6 +939,52 @@ impl TiktokenBuffer {
 #[pyfunction]
 fn _prepare_utf8(_texts: Vec<PyBackedStr>) {}
 
+#[pyclass(name = "_ReflectionSourceMemo")]
+struct ReflectionSourceMemo {
+    owner: Py<CoreBPE>,
+    allowed: HashSet<String>,
+    memo: crate::rmcp_reflection::ReflectionSourceMemo,
+}
+
+#[pymethods]
+impl ReflectionSourceMemo {
+    #[new]
+    fn new(owner: Py<CoreBPE>, allowed: HashSet<String>) -> Self {
+        Self { owner, allowed, memo: Default::default() }
+    }
+
+    fn stats(&self) -> (usize, usize, usize, usize, usize) {
+        self.memo.stats()
+    }
+
+    fn encode(
+        &mut self,
+        py: Python,
+        rendered: PyBackedStr,
+        points: Vec<usize>,
+        source_spans: Vec<(usize, usize)>,
+    ) -> PyResult<Option<(Py<PyAny>, Py<PyAny>, Vec<usize>, Vec<usize>)>> {
+        let encoder = self.owner.get();
+        let allowed = &self.allowed;
+        let memo = &mut self.memo;
+        let result = py.detach(|| {
+            let literal = allowed.iter().map(String::as_str).collect();
+            encoder.encode_reflection_fragments_with_memo(
+                rendered.as_ref(), &points, &source_spans, &literal, Some(memo),
+            )
+        })
+        .map_err(|error| PyErr::new::<exceptions::PyValueError, _>(error.message))?;
+        result.map(|encoded| {
+            Ok((
+                TiktokenBuffer::new(encoded.source).into_py_any(py)?,
+                TiktokenBuffer::new(encoded.physical).into_py_any(py)?,
+                encoded.source_ends,
+                encoded.physical_ends,
+            ))
+        }).transpose()
+    }
+}
+
 #[pymodule(gil_used = false)]
 fn _tiktoken(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(
@@ -950,6 +996,7 @@ fn _tiktoken(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(crate::rmcp_model::_admit_model_words, m)?)?;
 
     m.add_class::<CoreBPE>()?;
+    m.add_class::<ReflectionSourceMemo>()?;
     m.add_class::<TokenStorageEncoder>()?;
     m.add_class::<TokenStorageDecoder>()?;
     m.add_class::<TokenTierCodec>()?;
