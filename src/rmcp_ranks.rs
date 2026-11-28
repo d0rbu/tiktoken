@@ -104,8 +104,10 @@ pub(crate) struct EncoderRanks {
     long: HashMap<Vec<u8>, Rank>,
 }
 
-impl From<HashMap<Vec<u8>, Rank>> for EncoderRanks {
-    fn from(ranks: HashMap<Vec<u8>, Rank>) -> Self {
+impl EncoderRanks {
+    pub(crate) fn with_decoder(
+        ranks: HashMap<Vec<u8>, Rank>,
+    ) -> (Self, HashMap<Rank, Vec<u8>>) {
         let mut counts = [0; 3];
         for bytes in ranks.keys() {
             counts[match bytes.len() {
@@ -117,18 +119,26 @@ impl From<HashMap<Vec<u8>, Rank>> for EncoderRanks {
         let mut short = HashMap::with_capacity_and_hasher(counts[0], Default::default());
         let mut medium = HashMap::with_capacity_and_hasher(counts[1], Default::default());
         let mut long = HashMap::with_capacity_and_hasher(counts[2], Default::default());
+        let mut decoder = HashMap::with_capacity_and_hasher(ranks.len(), Default::default());
         for (bytes, rank) in ranks {
-            match bytes.len() {
-                0..=7 => short.insert(short_key(&bytes), rank),
-                8..=15 => medium.insert(MediumKey::from_bytes(&bytes), rank),
-                _ => long.insert(bytes, rank),
+            let decoded = match bytes.len() {
+                0..=7 => {
+                    short.insert(short_key(&bytes), rank);
+                    bytes
+                }
+                8..=15 => {
+                    medium.insert(MediumKey::from_bytes(&bytes), rank);
+                    bytes
+                }
+                _ => {
+                    let decoded = bytes.clone();
+                    long.insert(bytes, rank);
+                    decoded
+                }
             };
+            decoder.insert(rank, decoded);
         }
-        Self {
-            short,
-            medium,
-            long,
-        }
+        (Self { short, medium, long }, decoder)
     }
 }
 
@@ -191,6 +201,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn decoder_takes_owned_keys_when_the_encoder_packs_them() {
+        let mut input = HashMap::default();
+        input.insert(b"a\0b".to_vec(), 1);
+        input.insert(b"abcdefghijklmno".to_vec(), 2);
+        input.insert(b"abcdefghijklmno\0".to_vec(), 3);
+        let original = input.clone();
+        let addresses: HashMap<_, _> = input.iter().map(|(key, &id)| (id, key.as_ptr())).collect();
+        let (encoder, decoder) = EncoderRanks::with_decoder(input);
+        for (key, id) in original {
+            assert_eq!(encoder.get(&key), Some(&id));
+            assert_eq!(decoder[&id], key);
+        }
+        assert_eq!(decoder[&1].as_ptr(), addresses[&1]);
+        assert_eq!(decoder[&2].as_ptr(), addresses[&2]);
+        assert_ne!(decoder[&3].as_ptr(), addresses[&3]);
+    }
+
+    #[test]
     fn parent_window_matches_all_short_lengths_and_end_alignments() {
         for changed in 0..32 {
             for byte in 0..=255_u8 {
@@ -226,7 +254,7 @@ mod tests {
             }
         }
         original.insert(Vec::new(), Rank::MAX);
-        let ranks = EncoderRanks::from(original.clone());
+        let ranks = EncoderRanks::with_decoder(original.clone()).0;
         for seed in 0..16 {
             let source: Vec<u8> = (0..40).map(|i| ((i * 31 + seed * 7) % 256) as u8).collect();
             for parent_length in 0..=source.len() {
@@ -248,7 +276,7 @@ mod tests {
         let mut original = HashMap::default();
         original.insert(b"abc".to_vec(), Rank::MAX);
         original.insert(b"abcdefghijklmno".to_vec(), 17);
-        let ranks = EncoderRanks::from(original);
+        let ranks = EncoderRanks::with_decoder(original).0;
         for prefix in 0..20 {
             for suffix in 0..20 {
                 for key in [b"abc".as_slice(), b"abcdefghijklmno".as_slice()] {
@@ -317,7 +345,7 @@ mod tests {
                 }
             }
         }
-        let ranks = EncoderRanks::from(original.clone());
+        let ranks = EncoderRanks::with_decoder(original.clone()).0;
         assert_eq!(
             ranks.short.len() + ranks.medium.len() + ranks.long.len(),
             original.len()
@@ -352,7 +380,7 @@ mod tests {
                     },
                 );
             }
-            let ranks = EncoderRanks::from(original.clone());
+            let ranks = EncoderRanks::with_decoder(original.clone()).0;
             for len in 1..=160 {
                 let bytes: Vec<u8> = (0..len).map(|i| (i % 8) as u8).collect();
                 assert_eq!(

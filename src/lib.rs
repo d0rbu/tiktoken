@@ -1097,13 +1097,25 @@ impl CoreBPE {
             Regex::new(&parts.join("|"))?
         };
 
-        let decoder: HashMap<Rank, Vec<u8>> =
-            encoder.iter().map(|(k, v)| (*v, k.clone())).collect();
+        // Clone because I don't know how to tell Rust I'm not going to change the map
+        let mut sorted_token_bytes: Vec<Vec<u8>> = encoder.keys().cloned().collect();
+        sorted_token_bytes.sort();
 
+        // Initial adjacent-byte ranks are fixed for this vocabulary. Later
+        // merges still resolve their complete byte spans in the original map.
+        let mut pair_ranks = vec![Rank::MAX; 1 << 16].into_boxed_slice();
+        for (piece, &rank) in &encoder {
+            if let [left, right] = piece.as_slice() {
+                pair_ranks[pair_index(*left, *right)] = rank;
+            }
+        }
+
+        let encoder_len = encoder.len();
+        let (encoder, decoder) = EncoderRanks::with_decoder(encoder);
         assert!(
-            encoder.len() == decoder.len(),
+            encoder_len == decoder.len(),
             "Encoder and decoder must be of equal length. Encoder length: {}, decoder length: {}.\nMaybe you had duplicate token indices in your encoder?",
-            encoder.len(),
+            encoder_len,
             decoder.len()
         );
 
@@ -1119,21 +1131,8 @@ impl CoreBPE {
                 && special_tokens_decoder[rank].as_slice() == literal.as_bytes()
         });
 
-        // Clone because I don't know how to tell Rust I'm not going to change the map
-        let mut sorted_token_bytes: Vec<Vec<u8>> = encoder.keys().cloned().collect();
-        sorted_token_bytes.sort();
-
-        // Initial adjacent-byte ranks are fixed for this vocabulary. Later
-        // merges still resolve their complete byte spans in the original map.
-        let mut pair_ranks = vec![Rank::MAX; 1 << 16].into_boxed_slice();
-        for (piece, &rank) in &encoder {
-            if let [left, right] = piece.as_slice() {
-                pair_ranks[pair_index(*left, *right)] = rank;
-            }
-        }
-
         Ok(Self {
-            encoder: EncoderRanks::from(encoder),
+            encoder,
             pair_ranks,
             special_tokens_encoder,
             decoder,
