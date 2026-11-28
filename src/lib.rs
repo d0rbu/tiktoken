@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::num::NonZeroU64;
+use std::sync::OnceLock;
 use std::thread;
 
 use fancy_regex::Regex;
@@ -367,7 +368,7 @@ pub struct CoreBPE {
     regex_tls: Vec<Regex>,
     regular_regex_tls: Option<Vec<rmcp_regex::RegularRegex>>,
     special_regex_tls: Vec<Regex>,
-    sorted_token_bytes: Vec<Vec<u8>>,
+    sorted_token_bytes: OnceLock<Vec<Vec<u8>>>,
 }
 
 impl CoreBPE {
@@ -977,15 +978,10 @@ impl CoreBPE {
         // This is the easy bit. Just find all single tokens that start with unstable_bytes
         // (including tokens that exactly match unstable_bytes)
         // Separating this from the loop below helps with performance in a common case.
-        let mut point = self
-            .sorted_token_bytes
-            .partition_point(|x| x.as_slice() < unstable_bytes.as_slice());
-        while point < self.sorted_token_bytes.len()
-            && self.sorted_token_bytes[point].starts_with(&unstable_bytes)
-        {
-            completions.insert(vec![
-                self.encoder[self.sorted_token_bytes[point].as_slice()],
-            ]);
+        let ordered = self.sorted_token_bytes();
+        let mut point = ordered.partition_point(|x| x.as_slice() < unstable_bytes.as_slice());
+        while point < ordered.len() && ordered[point].starts_with(&unstable_bytes) {
+            completions.insert(vec![self.encoder[ordered[point].as_slice()]]);
             point += 1;
         }
 
@@ -995,14 +991,10 @@ impl CoreBPE {
         for i in 1..unstable_bytes.len() {
             let prefix = &unstable_bytes[..i];
             let suffix = &unstable_bytes[i..];
-            let mut point = self
-                .sorted_token_bytes
-                .partition_point(|x| x.as_slice() < suffix);
+            let mut point = ordered.partition_point(|x| x.as_slice() < suffix);
             // TODO: Perf optimisation if suffix starts with " "?
-            while point < self.sorted_token_bytes.len()
-                && self.sorted_token_bytes[point].starts_with(suffix)
-            {
-                let possibility = [prefix, self.sorted_token_bytes[point].as_slice()].concat();
+            while point < ordered.len() && ordered[point].starts_with(suffix) {
+                let possibility = [prefix, ordered[point].as_slice()].concat();
                 let encoded = match std::str::from_utf8(&possibility) {
                     // Morally, this is byte_pair_encode(&possibility, &self.encoder)
                     // But we might have introduced a regex split which would prevent merges.
@@ -1086,6 +1078,24 @@ impl CoreBPE {
         special_tokens_encoder: HashMap<String, Rank>,
         pattern: &str,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let core = Self::new_with_deferred_token_order(encoder, special_tokens_encoder, pattern)?;
+        core.sorted_token_bytes();
+        Ok(core)
+    }
+
+    fn sorted_token_bytes(&self) -> &[Vec<u8>] {
+        self.sorted_token_bytes.get_or_init(|| {
+            let mut ordered: Vec<Vec<u8>> = self.decoder.values().cloned().collect();
+            ordered.sort();
+            ordered
+        })
+    }
+
+    fn new_with_deferred_token_order(
+        encoder: HashMap<Vec<u8>, Rank>,
+        special_tokens_encoder: HashMap<String, Rank>,
+        pattern: &str,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let regex = Regex::new(pattern)?;
         let regular_regex = rmcp_regex::compile_if_guarded(pattern)?;
 
@@ -1119,10 +1129,6 @@ impl CoreBPE {
                 && special_tokens_decoder[rank].as_slice() == literal.as_bytes()
         });
 
-        // Clone because I don't know how to tell Rust I'm not going to change the map
-        let mut sorted_token_bytes: Vec<Vec<u8>> = encoder.keys().cloned().collect();
-        sorted_token_bytes.sort();
-
         // Initial adjacent-byte ranks are fixed for this vocabulary. Later
         // merges still resolve their complete byte spans in the original map.
         let mut pair_ranks = vec![Rank::MAX; 1 << 16].into_boxed_slice();
@@ -1145,7 +1151,7 @@ impl CoreBPE {
             special_regex_tls: (0..MAX_NUM_THREADS)
                 .map(|_| special_regex.clone())
                 .collect(),
-            sorted_token_bytes,
+            sorted_token_bytes: OnceLock::new(),
         })
     }
 
@@ -1184,6 +1190,38 @@ mod owned_batch_tests {
             pattern,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn deferred_token_order_matches_eager_completion_results() {
+        let pattern = r".+";
+        let eager = core(pattern);
+        let deferred = CoreBPE::new_with_deferred_token_order(
+            eager
+                .decoder
+                .iter()
+                .map(|(&rank, token)| (token.clone(), rank))
+                .collect(),
+            eager.special_tokens_encoder.clone(),
+            pattern,
+        )
+        .unwrap();
+        let allowed = HashSet::from(["<S>"]);
+        assert!(eager.sorted_token_bytes.get().is_some());
+        assert!(deferred.sorted_token_bytes.get().is_none());
+        assert_eq!(
+            eager.encode("abc a", &allowed).unwrap(),
+            deferred.encode("abc a", &allowed).unwrap(),
+        );
+        assert!(deferred.sorted_token_bytes.get().is_none());
+
+        for text in ["", "<S>", "a", "abc a", "abc  ", "雪a"] {
+            assert_eq!(
+                eager._encode_unstable_native(text, &allowed),
+                deferred._encode_unstable_native(text, &allowed),
+            );
+        }
+        assert_eq!(eager.sorted_token_bytes(), deferred.sorted_token_bytes());
     }
 
     #[test]

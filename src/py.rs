@@ -438,7 +438,7 @@ impl CoreBPE {
             .copied()
             .max()
             .unwrap();
-        let core = Self::new_internal(encoder, special_tokens, pattern)
+        let core = Self::new_with_deferred_token_order(encoder, special_tokens, pattern)
             .map_err(|e| PyErr::new::<exceptions::PyValueError, _>(e.to_string()))?;
         Ok((core, maximum))
     }
@@ -855,7 +855,7 @@ impl CoreBPE {
     // ====================
 
     fn token_byte_values(&self, py: Python) -> Vec<Py<PyBytes>> {
-        self.sorted_token_bytes
+        self.sorted_token_bytes()
             .iter()
             .map(|x| PyBytes::new(py, x).into())
             .collect()
