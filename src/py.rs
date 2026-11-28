@@ -721,6 +721,33 @@ impl CoreBPE {
         Ok((TiktokenBuffer::new(tokens).into_py_any(py)?, ends))
     }
 
+    fn _encode_reflection_fragments(
+        &self,
+        py: Python,
+        rendered: PyBackedStr,
+        points: Vec<usize>,
+        source_spans: Vec<(usize, usize)>,
+        allowed_special: HashSet<PyBackedStr>,
+    ) -> PyResult<Option<(Py<PyAny>, Py<PyAny>, Vec<usize>, Vec<usize>)>> {
+        let result = py
+            .detach(|| {
+                let allowed = allowed_special.iter().map(|token| token.as_ref()).collect();
+                self.encode_reflection_fragments(rendered.as_ref(), &points, &source_spans, &allowed)
+            })
+            .map_err(|error| PyErr::new::<exceptions::PyValueError, _>(error.message))?;
+        result
+            .map(|encoded| {
+                Ok((
+                    TiktokenBuffer::new(encoded.source).into_py_any(py)?,
+                    TiktokenBuffer::new(encoded.physical).into_py_any(py)?,
+                    encoded.source_ends,
+                    encoded.physical_ends,
+                ))
+            })
+            .transpose()
+    }
+
+
     fn _encode_bytes(&self, py: Python, bytes: &[u8]) -> Vec<Rank> {
         py.detach(|| {
             match std::str::from_utf8(bytes) {

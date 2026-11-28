@@ -13,6 +13,8 @@ mod py;
 mod rmcp_model;
 #[cfg(any(feature = "python", test))]
 mod rmcp_ranges;
+#[cfg(any(feature = "python", test))]
+mod rmcp_reflection;
 mod rmcp_ranks;
 mod rmcp_regex;
 use rmcp_ranks::{EncoderRanks, RankLookup};
@@ -728,23 +730,25 @@ impl CoreBPE {
     ) -> Result<(Vec<Rank>, usize, usize), EncodeError> {
         let mut tokens = Vec::new();
         reused.clear();
-        let (last_piece, count) = self.encode_into_workspace::<COUNT_ONLY>(
+        let (last_piece, count) = self.encode_into_workspace::<COUNT_ONLY, _>(
             text,
             allowed_special,
             parts,
             reused,
             &mut tokens,
+            |_, _| {},
         )?;
         Ok((tokens, last_piece, count))
     }
 
-    fn encode_into_workspace<'a, const COUNT_ONLY: bool>(
+    fn encode_into_workspace<'a, const COUNT_ONLY: bool, F: FnMut(usize, usize)>(
         &'a self,
         text: &'a str,
         allowed_special: &HashSet<&str>,
         parts: &mut Vec<(usize, Rank)>,
         reused: &mut HashMap<&'a [u8], (usize, usize)>,
         ret: &mut Vec<Rank>,
+        mut record: F,
     ) -> Result<(usize, usize), EncodeError> {
         let special_regex = self._get_tl_special_regex();
         let mut count = 0;
@@ -782,6 +786,7 @@ impl CoreBPE {
 
                 let piece = piece.as_bytes();
                 let piece_start = piece.as_ptr() as usize - text.as_ptr() as usize;
+                record(piece_start, ret.len());
                 if let Some(token) =
                     self.encoder
                         .get_span(text.as_bytes(), piece_start, piece_start + piece.len())
@@ -794,9 +799,13 @@ impl CoreBPE {
                     }
                     continue;
                 }
-                if !COUNT_ONLY && let Some(&(start, end)) = reused.get(piece) {
+                if let Some(&(start, end)) = reused.get(piece) {
                     last_piece_token_len = end - start;
-                    ret.extend_from_within(start..end);
+                    if COUNT_ONLY {
+                        count += last_piece_token_len;
+                    } else {
+                        ret.extend_from_within(start..end);
+                    }
                     continue;
                 }
                 let output_start = ret.len();
@@ -824,17 +833,25 @@ impl CoreBPE {
                         ret.extend(&tokens);
                     }
                 }
-                if !COUNT_ONLY && reused.len() < MAX_PIECE_REUSE {
+                if reused.len() < MAX_PIECE_REUSE {
                     if reused.is_empty() {
                         reused.reserve(64);
                     }
-                    reused.insert(piece, (output_start, ret.len()));
+                    // Counting has no output buffer. Keep just the piece length
+                    // in the same interval representation used for emitted IDs.
+                    let end = if COUNT_ONLY {
+                        output_start + last_piece_token_len
+                    } else {
+                        ret.len()
+                    };
+                    reused.insert(piece, (output_start, end));
                 }
             }
 
             match next_special {
                 // And here we push the special token
                 Some(m) => {
+                    record(m.start(), ret.len());
                     let piece = m.as_str();
                     let token = self.special_tokens_encoder[piece];
                     if COUNT_ONLY {
@@ -888,12 +905,13 @@ impl CoreBPE {
         // inputs and append-only output. Every text still gets its own regex scan.
         let mut reused = HashMap::default();
         for text in texts {
-            self.encode_into_workspace::<false>(
+            self.encode_into_workspace::<false, _>(
                 text,
                 allowed_special,
                 &mut parts,
                 &mut reused,
                 &mut tokens,
+                |_, _| {},
             )?;
             ends.push(tokens.len());
         }
@@ -1090,13 +1108,25 @@ impl CoreBPE {
             Regex::new(&parts.join("|"))?
         };
 
-        let decoder: HashMap<Rank, Vec<u8>> =
-            encoder.iter().map(|(k, v)| (*v, k.clone())).collect();
+        // Clone because I don't know how to tell Rust I'm not going to change the map
+        let mut sorted_token_bytes: Vec<Vec<u8>> = encoder.keys().cloned().collect();
+        sorted_token_bytes.sort();
 
+        // Initial adjacent-byte ranks are fixed for this vocabulary. Later
+        // merges still resolve their complete byte spans in the original map.
+        let mut pair_ranks = vec![Rank::MAX; 1 << 16].into_boxed_slice();
+        for (piece, &rank) in &encoder {
+            if let [left, right] = piece.as_slice() {
+                pair_ranks[pair_index(*left, *right)] = rank;
+            }
+        }
+
+        let encoder_len = encoder.len();
+        let (encoder, decoder) = EncoderRanks::with_decoder(encoder);
         assert!(
-            encoder.len() == decoder.len(),
+            encoder_len == decoder.len(),
             "Encoder and decoder must be of equal length. Encoder length: {}, decoder length: {}.\nMaybe you had duplicate token indices in your encoder?",
-            encoder.len(),
+            encoder_len,
             decoder.len()
         );
 
@@ -1112,21 +1142,8 @@ impl CoreBPE {
                 && special_tokens_decoder[rank].as_slice() == literal.as_bytes()
         });
 
-        // Clone because I don't know how to tell Rust I'm not going to change the map
-        let mut sorted_token_bytes: Vec<Vec<u8>> = encoder.keys().cloned().collect();
-        sorted_token_bytes.sort();
-
-        // Initial adjacent-byte ranks are fixed for this vocabulary. Later
-        // merges still resolve their complete byte spans in the original map.
-        let mut pair_ranks = vec![Rank::MAX; 1 << 16].into_boxed_slice();
-        for (piece, &rank) in &encoder {
-            if let [left, right] = piece.as_slice() {
-                pair_ranks[pair_index(*left, *right)] = rank;
-            }
-        }
-
         Ok(Self {
-            encoder: EncoderRanks::from(encoder),
+            encoder,
             pair_ranks,
             special_tokens_encoder,
             decoder,
