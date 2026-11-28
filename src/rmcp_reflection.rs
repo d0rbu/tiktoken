@@ -32,6 +32,43 @@ fn ordinary_cut(bytes: &[u8], position: usize) -> bool {
         || ((b'!'..=b'~').contains(&bytes[position - 1]) && ascii_whitespace(bytes[position]))
 }
 
+// The caller advances through sorted character positions, so the start of
+// each slice is already a character boundary.
+fn char_point_byte(text: &str, point: usize) -> Option<usize> {
+    #[cfg(target_arch = "x86_64")]
+    let (mut offset, mut remaining) = (0, point);
+    #[cfg(not(target_arch = "x86_64"))]
+    let (offset, remaining) = (0, point);
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::{
+            __m128i, _mm_and_si128, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8,
+            _mm_set1_epi8,
+        };
+
+        let bytes = text.as_bytes();
+        while remaining >= 16 && bytes.len() - offset >= 16 {
+            // SSE2 is available on x86-64. The bounds check covers the entire load.
+            let continuations = unsafe {
+                let chunk = _mm_loadu_si128(bytes.as_ptr().add(offset).cast::<__m128i>());
+                let tags = _mm_and_si128(chunk, _mm_set1_epi8(0xc0_u8 as i8));
+                _mm_movemask_epi8(_mm_cmpeq_epi8(tags, _mm_set1_epi8(0x80_u8 as i8)))
+            };
+            remaining -= 16 - continuations.count_ones() as usize;
+            offset += 16;
+        }
+        // The last character start may precede the last vector boundary.
+        while bytes.get(offset).is_some_and(|byte| byte & 0xc0 == 0x80) {
+            offset += 1;
+        }
+    }
+    text[offset..]
+        .char_indices()
+        .map(|(index, _)| offset + index)
+        .chain(std::iter::once(text.len()))
+        .nth(remaining)
+}
+
 impl CoreBPE {
     pub(crate) fn encode_reflection_fragments(
         &self,
@@ -56,15 +93,17 @@ impl CoreBPE {
             }
             Cow::Borrowed(points)
         } else {
-            let mut indices = rendered.char_indices().chain([(rendered.len(), '\0')]);
-            let mut next = 0;
+            let mut offset = 0;
+            let mut previous_point = 0;
             let mut offsets = Vec::with_capacity(points.len());
             for &point in points {
-                let Some((offset, _)) = indices.nth(point - next) else {
+                let Some(advance) = char_point_byte(&rendered[offset..], point - previous_point)
+                else {
                     return Ok(None);
                 };
+                offset += advance;
                 offsets.push(offset);
-                next = point + 1;
+                previous_point = point;
             }
             Cow::Owned(offsets)
         };
@@ -197,6 +236,30 @@ impl CoreBPE {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn char_point_byte_matches_scalar_offsets_across_chunk_boundaries() {
+        for padding in 0..32 {
+            let text = format!(
+                "{}{}",
+                "a".repeat(padding),
+                "é\u{0301}\0中🙂 alpha ".repeat(10)
+            );
+            let offsets: Vec<_> = text
+                .char_indices()
+                .map(|(offset, _)| offset)
+                .chain(std::iter::once(text.len()))
+                .collect();
+            for (point, &offset) in offsets.iter().enumerate() {
+                assert_eq!(char_point_byte(&text, point), Some(offset));
+                assert_eq!(
+                    char_point_byte(&text[offset..], offsets.len() - 1 - point),
+                    Some(text.len() - offset)
+                );
+            }
+            assert_eq!(char_point_byte(&text, offsets.len()), None);
+        }
+    }
 
     fn model(pattern: &str) -> CoreBPE {
         let mut vocab = (0u8..=255)
