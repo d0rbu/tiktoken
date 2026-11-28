@@ -355,6 +355,71 @@ impl std::error::Error for EncodeError {}
 const MAX_NUM_THREADS: usize = 128;
 const MAX_PIECE_REUSE: usize = 1024;
 
+#[derive(Clone)]
+struct SortedTokenBytes {
+    bytes: Vec<u8>,
+    ranges: Vec<std::ops::Range<usize>>,
+}
+
+impl SortedTokenBytes {
+    fn new(encoder: &HashMap<Vec<u8>, Rank>) -> Self {
+        let mut keys = encoder.keys().map(Vec::as_slice).collect::<Vec<_>>();
+        keys.sort();
+
+        let mut bytes = Vec::with_capacity(keys.iter().map(|key| key.len()).sum());
+        let mut ranges = Vec::with_capacity(keys.len());
+        for key in keys {
+            let start = bytes.len();
+            bytes.extend_from_slice(key);
+            ranges.push(start..bytes.len());
+        }
+        Self { bytes, ranges }
+    }
+
+    fn iter_from(&self, start: usize) -> impl Iterator<Item = &[u8]> {
+        self.ranges[start..]
+            .iter()
+            .map(|range| &self.bytes[range.clone()])
+    }
+
+    #[cfg(feature = "python")]
+    fn iter(&self) -> impl Iterator<Item = &[u8]> {
+        self.iter_from(0)
+    }
+
+    fn starting_with<'a>(&'a self, prefix: &'a [u8]) -> impl Iterator<Item = &'a [u8]> + 'a {
+        let start = self
+            .ranges
+            .partition_point(|range| &self.bytes[range.clone()] < prefix);
+        self.iter_from(start).take_while(move |key| key.starts_with(prefix))
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn sorted_token_bytes_preserve_prefix_ranges() {
+    let encoder = [
+        (b"".to_vec(), 0),
+        (b"a".to_vec(), 1),
+        (b"a\0".to_vec(), 2),
+        (b"ab".to_vec(), 3),
+        (b"b".to_vec(), 4),
+        (b"\xff".to_vec(), 5),
+    ]
+    .into_iter()
+    .collect();
+    let keys = SortedTokenBytes::new(&encoder);
+
+    assert_eq!(keys.starting_with(b"").count(), 6);
+    assert_eq!(
+        keys.starting_with(b"a").collect::<Vec<_>>(),
+        [b"a".as_slice(), b"a\0", b"ab"],
+    );
+    assert_eq!(keys.starting_with(b"a\0").collect::<Vec<_>>(), [b"a\0"]);
+    assert_eq!(keys.starting_with(b"az").next(), None);
+    assert_eq!(keys.starting_with(b"\xff").collect::<Vec<_>>(), [b"\xff"]);
+}
+
 #[cfg_attr(feature = "python", pyclass(frozen))]
 #[derive(Clone)]
 pub struct CoreBPE {
@@ -367,7 +432,7 @@ pub struct CoreBPE {
     regex_tls: Vec<Regex>,
     regular_regex_tls: Option<Vec<rmcp_regex::RegularRegex>>,
     special_regex_tls: Vec<Regex>,
-    sorted_token_bytes: Vec<Vec<u8>>,
+    sorted_token_bytes: SortedTokenBytes,
 }
 
 impl CoreBPE {
@@ -977,16 +1042,8 @@ impl CoreBPE {
         // This is the easy bit. Just find all single tokens that start with unstable_bytes
         // (including tokens that exactly match unstable_bytes)
         // Separating this from the loop below helps with performance in a common case.
-        let mut point = self
-            .sorted_token_bytes
-            .partition_point(|x| x.as_slice() < unstable_bytes.as_slice());
-        while point < self.sorted_token_bytes.len()
-            && self.sorted_token_bytes[point].starts_with(&unstable_bytes)
-        {
-            completions.insert(vec![
-                self.encoder[self.sorted_token_bytes[point].as_slice()],
-            ]);
-            point += 1;
+        for key in self.sorted_token_bytes.starting_with(&unstable_bytes) {
+            completions.insert(vec![self.encoder[key]]);
         }
 
         // Now apply even more brute force. At every (other) possible position for the straddling
@@ -995,14 +1052,9 @@ impl CoreBPE {
         for i in 1..unstable_bytes.len() {
             let prefix = &unstable_bytes[..i];
             let suffix = &unstable_bytes[i..];
-            let mut point = self
-                .sorted_token_bytes
-                .partition_point(|x| x.as_slice() < suffix);
             // TODO: Perf optimisation if suffix starts with " "?
-            while point < self.sorted_token_bytes.len()
-                && self.sorted_token_bytes[point].starts_with(suffix)
-            {
-                let possibility = [prefix, self.sorted_token_bytes[point].as_slice()].concat();
+            for key in self.sorted_token_bytes.starting_with(suffix) {
+                let possibility = [prefix, key].concat();
                 let encoded = match std::str::from_utf8(&possibility) {
                     // Morally, this is byte_pair_encode(&possibility, &self.encoder)
                     // But we might have introduced a regex split which would prevent merges.
@@ -1032,7 +1084,6 @@ impl CoreBPE {
                     }
                 }
                 completions.insert(seq);
-                point += 1;
             }
         }
 
@@ -1097,9 +1148,7 @@ impl CoreBPE {
             Regex::new(&parts.join("|"))?
         };
 
-        // Clone because I don't know how to tell Rust I'm not going to change the map
-        let mut sorted_token_bytes: Vec<Vec<u8>> = encoder.keys().cloned().collect();
-        sorted_token_bytes.sort();
+        let sorted_token_bytes = SortedTokenBytes::new(&encoder);
 
         // Initial adjacent-byte ranks are fixed for this vocabulary. Later
         // merges still resolve their complete byte spans in the original map.
