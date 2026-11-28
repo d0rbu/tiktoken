@@ -70,6 +70,28 @@ fn char_point_byte(text: &str, point: usize) -> Option<usize> {
 }
 
 impl CoreBPE {
+    fn append_reflection_fragment<'a>(
+        &'a self,
+        text: &'a str,
+        allowed: &HashSet<&str>,
+        parts: &mut Vec<(usize, Rank)>,
+        reused: &mut HashMap<&'a [u8], (usize, usize)>,
+        tokens: &mut Vec<Rank>,
+        direct_byte: bool,
+    ) -> Result<(), EncodeError> {
+        // One byte of valid UTF-8 is one ASCII scalar. This guarded lexer
+        // emits it as one ordinary piece unless an allowed special can match.
+        if direct_byte
+            && text.len() == 1
+            && let Some(rank) = self.encoder.get_span(text.as_bytes(), 0, 1)
+        {
+            tokens.push(*rank);
+            return Ok(());
+        }
+        self.encode_into_workspace::<false, _>(text, allowed, parts, reused, tokens, |_, _| {})?;
+        Ok(())
+    }
+
     pub(crate) fn encode_reflection_fragments(
         &self,
         rendered: &str,
@@ -182,6 +204,7 @@ impl CoreBPE {
         if ranks.len() != anchors.len() {
             return Ok(None);
         }
+        let direct_byte = allowed.iter().all(|special| special.len() > 1);
         let mut ends = Vec::with_capacity(which.len());
         for (bounds, index) in byte_points.windows(2).zip(which) {
             if let Some(Interior {
@@ -191,34 +214,34 @@ impl CoreBPE {
             }) = index.and_then(|index| plans[index])
             {
                 if !head.is_empty() {
-                    self.encode_into_workspace::<false, _>(
+                    self.append_reflection_fragment(
                         head,
                         allowed,
                         &mut parts,
                         &mut reused,
                         &mut tokens,
-                        |_, _| {},
+                        direct_byte,
                     )?;
                 }
                 tokens.extend_from_within(ranks[first_anchor]..ranks[first_anchor + 1]);
                 if !tail.is_empty() {
-                    self.encode_into_workspace::<false, _>(
+                    self.append_reflection_fragment(
                         tail,
                         allowed,
                         &mut parts,
                         &mut reused,
                         &mut tokens,
-                        |_, _| {},
+                        direct_byte,
                     )?;
                 }
             } else {
-                self.encode_into_workspace::<false, _>(
+                self.append_reflection_fragment(
                     &rendered[bounds[0]..bounds[1]],
                     allowed,
                     &mut parts,
                     &mut reused,
                     &mut tokens,
-                    |_, _| {},
+                    direct_byte,
                 )?;
             }
             ends.push(tokens.len() - source_count);
@@ -258,6 +281,32 @@ mod tests {
                 );
             }
             assert_eq!(char_point_byte(&text, offsets.len()), None);
+        }
+    }
+
+    #[test]
+    fn single_byte_fragments_preserve_allowed_specials_and_all_ascii_classes() {
+        let vocab = (0u8..=255)
+            .map(|byte| (vec![byte], Rank::from(byte)))
+            .collect::<HashMap<_, _>>();
+        let model = CoreBPE::new_internal(
+            vocab, [("x".into(), 256), ("<r>".into(), 257)].into_iter().collect(),
+            include_str!("rmcp_pattern.txt"),
+        ).unwrap();
+        let rendered: String = (0u8..=127).map(char::from).collect();
+        let points: Vec<_> = (0..=128).collect();
+        for allowed in [HashSet::from(["x"]), HashSet::from(["<r>"])] {
+            let outcome = model
+                .encode_reflection_fragments(&rendered, &points, &[(0, 1)], &allowed)
+                .unwrap()
+                .unwrap();
+            let (physical, ends) = model.encode_batch_packed(
+                rendered.as_bytes().chunks(1).map(|piece| std::str::from_utf8(piece).unwrap()),
+                &allowed,
+            ).unwrap();
+            assert_eq!(outcome.source, [0]);
+            assert_eq!(outcome.physical, physical);
+            assert_eq!(outcome.physical_ends, ends);
         }
     }
 
