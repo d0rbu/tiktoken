@@ -799,9 +799,13 @@ impl CoreBPE {
                     }
                     continue;
                 }
-                if !COUNT_ONLY && let Some(&(start, end)) = reused.get(piece) {
+                if let Some(&(start, end)) = reused.get(piece) {
                     last_piece_token_len = end - start;
-                    ret.extend_from_within(start..end);
+                    if COUNT_ONLY {
+                        count += last_piece_token_len;
+                    } else {
+                        ret.extend_from_within(start..end);
+                    }
                     continue;
                 }
                 let output_start = ret.len();
@@ -829,11 +833,18 @@ impl CoreBPE {
                         ret.extend(&tokens);
                     }
                 }
-                if !COUNT_ONLY && reused.len() < MAX_PIECE_REUSE {
+                if reused.len() < MAX_PIECE_REUSE {
                     if reused.is_empty() {
                         reused.reserve(64);
                     }
-                    reused.insert(piece, (output_start, ret.len()));
+                    // Counting has no output buffer. Keep just the piece length
+                    // in the same interval representation used for emitted IDs.
+                    let end = if COUNT_ONLY {
+                        output_start + last_piece_token_len
+                    } else {
+                        ret.len()
+                    };
+                    reused.insert(piece, (output_start, end));
                 }
             }
 
